@@ -1,11 +1,66 @@
 package agentcore
 
-// emit sends an event to the channel (non-blocking if channel is full, drops event).
+import (
+	"encoding/json"
+	"time"
+)
+
+// ---------------------------------------------------------------------------
+// Agent Events
+// ---------------------------------------------------------------------------
+
+// EventType identifies agent lifecycle event types.
+type EventType string
+
+const (
+	EventAgentStart     EventType = "agent_start"
+	EventAgentEnd       EventType = "agent_end"
+	EventTurnStart      EventType = "turn_start"
+	EventTurnEnd        EventType = "turn_end"
+	EventMessageStart   EventType = "message_start"
+	EventMessageUpdate  EventType = "message_update"
+	EventMessageEnd     EventType = "message_end"
+	EventToolExecStart  EventType = "tool_exec_start"
+	EventToolExecUpdate EventType = "tool_exec_update"
+	EventToolExecEnd    EventType = "tool_exec_end"
+	EventRetry          EventType = "retry"
+	EventError          EventType = "error"
+)
+
+// Event is a lifecycle event emitted by the agent loop.
+// This is the single output channel for all lifecycle information.
+type Event struct {
+	Type        EventType
+	Message     AgentMessage    // for message_start/update/end, turn_end
+	Delta       string          // text delta for message_update
+	ToolID      string          // for tool_exec_*
+	Tool        string          // tool name for tool_exec_*
+	ToolLabel   string          // human-readable tool label (from ToolLabeler)
+	Args        json.RawMessage // tool args for tool_exec_start
+	Result      json.RawMessage // tool result for tool_exec_end/update
+	IsError     bool            // tool error flag for tool_exec_end
+	ToolResults []ToolResult    // for turn_end: all tool results from this turn
+	Err         error           // for error events
+	NewMessages []AgentMessage  // for agent_end: messages added during this loop
+	RetryInfo   *RetryInfo      // for retry events
+}
+
+// RetryInfo carries retry context for EventRetry events.
+type RetryInfo struct {
+	Attempt    int
+	MaxRetries int
+	Delay      time.Duration
+	Err        error
+}
+
+// ---------------------------------------------------------------------------
+// Event Helpers
+// ---------------------------------------------------------------------------
+
+// emit sends an event to the channel. Blocks if the channel is full,
+// creating backpressure to prevent event loss.
 func emit(ch chan<- Event, ev Event) {
-	select {
-	case ch <- ev:
-	default:
-	}
+	ch <- ev
 }
 
 // emitError sends an error event followed by agent_end.
@@ -13,6 +68,10 @@ func emitError(ch chan<- Event, err error) {
 	emit(ch, Event{Type: EventError, Err: err})
 	emit(ch, Event{Type: EventAgentEnd, Err: err})
 }
+
+// ---------------------------------------------------------------------------
+// Message Sequence Repair
+// ---------------------------------------------------------------------------
 
 // DefaultConvertToLLM filters AgentMessages to LLM-compatible Messages.
 // Custom message types are dropped; only user/assistant/system/tool messages pass through.

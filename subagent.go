@@ -50,11 +50,22 @@ type subagentChain struct {
 
 // subagentResult captures one sub-agent's execution outcome.
 type subagentResult struct {
-	Agent   string `json:"agent"`
-	Task    string `json:"task"`
-	Output  string `json:"output"`
-	IsError bool   `json:"is_error,omitempty"`
-	Step    int    `json:"step,omitempty"`
+	Agent   string         `json:"agent"`
+	Task    string         `json:"task"`
+	Output  string         `json:"output"`
+	IsError bool           `json:"is_error,omitempty"`
+	Step    int            `json:"step,omitempty"`
+	Usage   *subagentUsage `json:"usage,omitempty"`
+}
+
+// subagentUsage tracks token consumption and cost for a sub-agent run.
+type subagentUsage struct {
+	Input      int     `json:"input"`
+	Output     int     `json:"output"`
+	CacheRead  int     `json:"cache_read"`
+	CacheWrite int     `json:"cache_write"`
+	Cost       float64 `json:"cost"`
+	Turns      int     `json:"turns"`
 }
 
 // SubAgentTool implements the Tool interface.
@@ -133,11 +144,17 @@ func (t *SubAgentTool) Execute(ctx context.Context, args json.RawMessage) (json.
 
 // executeSingle runs one sub-agent with an isolated context.
 func (t *SubAgentTool) executeSingle(ctx context.Context, agentName, task string) (json.RawMessage, error) {
-	output, err := t.runAgent(ctx, agentName, task)
+	output, usage, err := t.runAgent(ctx, agentName, task)
 	if err != nil {
-		return json.Marshal(fmt.Sprintf("Agent %q failed: %v", agentName, err))
+		return json.Marshal(map[string]any{
+			"error": fmt.Sprintf("Agent %q failed: %v", agentName, err),
+			"usage": usage,
+		})
 	}
-	return json.Marshal(output)
+	return json.Marshal(map[string]any{
+		"output": output,
+		"usage":  usage,
+	})
 }
 
 // executeChain runs sub-agents sequentially, passing each output to the next via {previous}.
@@ -151,12 +168,13 @@ func (t *SubAgentTool) executeChain(ctx context.Context, chain []subagentChain) 
 		}
 
 		task := strings.ReplaceAll(step.Task, "{previous}", previous)
-		output, err := t.runAgent(ctx, step.Agent, task)
+		output, usage, err := t.runAgent(ctx, step.Agent, task)
 
 		result := subagentResult{
 			Agent: step.Agent,
 			Task:  task,
 			Step:  i + 1,
+			Usage: usage,
 		}
 
 		if err != nil {
@@ -197,10 +215,11 @@ func (t *SubAgentTool) executeParallel(ctx context.Context, tasks []subagentTask
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			output, err := t.runAgent(ctx, st.Agent, st.Task)
+			output, usage, err := t.runAgent(ctx, st.Agent, st.Task)
 			result := subagentResult{
 				Agent: st.Agent,
 				Task:  st.Task,
+				Usage: usage,
 			}
 			if err != nil {
 				result.Output = err.Error()
@@ -228,18 +247,23 @@ func (t *SubAgentTool) executeParallel(ctx context.Context, tasks []subagentTask
 }
 
 // runAgent executes an isolated agent loop for the given agent config and task.
-// Returns the final assistant output text.
-func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string) (string, error) {
+// Includes panic recovery to prevent a subagent crash from taking down the parent.
+func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string) (output string, usage *subagentUsage, err error) {
 	cfg, ok := t.agents[agentName]
 	if !ok {
 		available := make([]string, 0, len(t.agents))
 		for name := range t.agents {
 			available = append(available, name)
 		}
-		return "", fmt.Errorf("unknown agent %q, available: %s", agentName, strings.Join(available, ", "))
+		return "", nil, fmt.Errorf("unknown agent %q, available: %s", agentName, strings.Join(available, ", "))
 	}
 
-	userMsg := UserMsg(task)
+	// Panic recovery — isolated subagent should never crash the parent
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("subagent %q panicked: %v", agentName, r)
+		}
+	}()
 
 	agentCtx := AgentContext{
 		SystemPrompt: cfg.SystemPrompt,
@@ -255,17 +279,31 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string) (st
 		loopCfg.MaxTurns = defaultMaxTurns
 	}
 
-	events := AgentLoop(ctx, []AgentMessage{userMsg}, agentCtx, loopCfg)
+	events := AgentLoop(ctx, []AgentMessage{UserMsg(task)}, agentCtx, loopCfg)
 
-	// Consume events, extract final assistant output
 	var lastAssistantContent string
 	var lastErr error
+	su := &subagentUsage{}
 
 	for ev := range events {
 		switch ev.Type {
 		case EventMessageEnd:
-			if ev.Message != nil && ev.Message.GetRole() == RoleAssistant {
+			if ev.Message == nil {
+				continue
+			}
+			if ev.Message.GetRole() == RoleAssistant {
 				lastAssistantContent = ev.Message.TextContent()
+				su.Turns++
+				// Accumulate usage from assistant messages
+				if msg, ok := ev.Message.(Message); ok && msg.Usage != nil {
+					su.Input += msg.Usage.Input
+					su.Output += msg.Usage.Output
+					su.CacheRead += msg.Usage.CacheRead
+					su.CacheWrite += msg.Usage.CacheWrite
+					if msg.Usage.Cost != nil {
+						su.Cost += msg.Usage.Cost.Total
+					}
+				}
 			}
 		case EventError:
 			if ev.Err != nil {
@@ -275,14 +313,12 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string) (st
 	}
 
 	if lastErr != nil && lastAssistantContent == "" {
-		return "", lastErr
+		return "", su, lastErr
 	}
-
 	if lastAssistantContent == "" {
-		return "(no output)", nil
+		return "(no output)", su, nil
 	}
-
-	return lastAssistantContent, nil
+	return lastAssistantContent, su, nil
 }
 
 func boolToInt(b bool) int {

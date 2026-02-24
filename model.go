@@ -1,0 +1,215 @@
+package agentcore
+
+import (
+	"context"
+	"time"
+)
+
+// ---------------------------------------------------------------------------
+// Agent Context & Loop Config
+// ---------------------------------------------------------------------------
+
+// AgentContext holds the immutable context for a single agent loop invocation.
+type AgentContext struct {
+	SystemPrompt string
+	Messages     []AgentMessage
+	Tools        []Tool
+}
+
+// StreamFn is an injectable LLM call function.
+// When nil, the loop uses model.Generate / model.GenerateStream directly.
+type StreamFn func(ctx context.Context, req *LLMRequest) (*LLMResponse, error)
+
+// LLMRequest is the request passed to StreamFn.
+type LLMRequest struct {
+	Messages []Message
+	Tools    []ToolSpec
+}
+
+// LLMResponse is the response from StreamFn.
+type LLMResponse struct {
+	Message Message
+}
+
+// ToolSpec describes a tool for the LLM (name + description + JSON schema).
+type ToolSpec struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Parameters  any    `json:"parameters"`
+}
+
+// LoopConfig configures the agent loop.
+type LoopConfig struct {
+	Model         ChatModel
+	StreamFn      StreamFn      // nil = use Model directly
+	MaxTurns      int           // safety limit, default 10
+	MaxRetries    int           // LLM call retry limit for retryable errors, default 3
+	MaxToolErrors int           // consecutive tool failure threshold per tool, 0 = unlimited
+	ThinkingLevel ThinkingLevel // reasoning depth
+
+	// Two-stage pipeline: TransformContext -> ConvertToLLM
+	TransformContext func(ctx context.Context, msgs []AgentMessage) ([]AgentMessage, error)
+	ConvertToLLM     func(msgs []AgentMessage) []Message
+
+	// CheckPermission is called before each tool execution.
+	// Return nil to allow, or error to deny (error becomes tool error result).
+	// When nil, all tools are allowed.
+	CheckPermission PermissionFunc
+
+	// GetApiKey resolves the API key before each LLM call.
+	// The provider parameter identifies which provider is being called (e.g. "openai", "anthropic").
+	// Enables per-provider key resolution, key rotation, OAuth tokens, and multi-tenant scenarios.
+	// When nil or returns empty string, the model's default key is used.
+	GetApiKey func(provider string) (string, error)
+
+	// ThinkingBudgets maps each ThinkingLevel to a max thinking token count.
+	// When set, the resolved budget is passed to the model alongside the level.
+	ThinkingBudgets map[ThinkingLevel]int
+
+	// SessionID enables provider-level session caching (e.g. Anthropic prompt cache).
+	SessionID string
+
+	// Steering: called after each tool execution to check for user interruptions.
+	GetSteeringMessages func() []AgentMessage
+
+	// FollowUp: called when the agent would otherwise stop.
+	GetFollowUpMessages func() []AgentMessage
+
+	// MaxRetryDelay caps the wait time between retries (including server-requested Retry-After).
+	// Default: 60s. Set to prevent excessively long waits from overloaded providers.
+	MaxRetryDelay time.Duration
+
+	// Middlewares are applied around each tool execution (outermost first).
+	// Use for logging, timing, argument/result modification, etc.
+	Middlewares []ToolMiddleware
+}
+
+// ---------------------------------------------------------------------------
+// Context Usage Estimation
+// ---------------------------------------------------------------------------
+
+// ContextEstimateFn estimates the current context token consumption from messages.
+// Returns total tokens, tokens from LLM Usage, and estimated trailing tokens.
+type ContextEstimateFn func(msgs []AgentMessage) (tokens, usageTokens, trailingTokens int)
+
+// ContextUsage represents the current context window occupancy estimate.
+type ContextUsage struct {
+	Tokens         int     `json:"tokens"`          // estimated total tokens in context
+	ContextWindow  int     `json:"context_window"`  // model's context window size
+	Percent        float64 `json:"percent"`         // tokens / contextWindow * 100
+	UsageTokens    int     `json:"usage_tokens"`    // from last LLM-reported Usage
+	TrailingTokens int     `json:"trailing_tokens"` // chars/4 estimate for trailing messages
+}
+
+// ---------------------------------------------------------------------------
+// Call Options
+// ---------------------------------------------------------------------------
+
+// CallOption configures per-call LLM parameters.
+type CallOption func(*CallConfig)
+
+// CallConfig holds per-call configuration resolved from CallOptions.
+type CallConfig struct {
+	ThinkingLevel  ThinkingLevel
+	ThinkingBudget int    // max thinking tokens, 0 = use provider default
+	APIKey         string // per-call API key override, empty = use model default
+	SessionID      string // provider session caching identifier
+}
+
+// ResolveCallConfig applies options and returns the resolved config.
+func ResolveCallConfig(opts []CallOption) CallConfig {
+	var cfg CallConfig
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	return cfg
+}
+
+// WithThinking sets the thinking level for a single LLM call.
+func WithThinking(level ThinkingLevel) CallOption {
+	return func(c *CallConfig) { c.ThinkingLevel = level }
+}
+
+// WithThinkingBudget sets the max thinking tokens for a single LLM call.
+func WithThinkingBudget(tokens int) CallOption {
+	return func(c *CallConfig) { c.ThinkingBudget = tokens }
+}
+
+// WithAPIKey overrides the API key for a single LLM call.
+// Enables key rotation, OAuth short-lived tokens, and multi-tenant scenarios.
+func WithAPIKey(key string) CallOption {
+	return func(c *CallConfig) { c.APIKey = key }
+}
+
+// WithCallSessionID sets a session identifier for a single LLM call.
+func WithCallSessionID(id string) CallOption {
+	return func(c *CallConfig) { c.SessionID = id }
+}
+
+// ---------------------------------------------------------------------------
+// ChatModel Interface
+// ---------------------------------------------------------------------------
+
+// ChatModel is the LLM provider interface.
+type ChatModel interface {
+	Generate(ctx context.Context, messages []Message, tools []ToolSpec, opts ...CallOption) (*LLMResponse, error)
+	GenerateStream(ctx context.Context, messages []Message, tools []ToolSpec, opts ...CallOption) (<-chan StreamEvent, error)
+	SupportsTools() bool
+}
+
+// ProviderNamer is an optional interface for ChatModel implementations
+// to expose their provider name (e.g. "openai", "anthropic", "gemini").
+// Used by the agent loop to pass provider context to GetApiKey callbacks.
+type ProviderNamer interface {
+	ProviderName() string
+}
+
+// ---------------------------------------------------------------------------
+// Stream Events (fine-grained)
+// ---------------------------------------------------------------------------
+
+// StreamEventType identifies LLM streaming event types.
+type StreamEventType string
+
+const (
+	// Text content streaming
+	StreamEventTextStart StreamEventType = "text_start"
+	StreamEventTextDelta StreamEventType = "text_delta"
+	StreamEventTextEnd   StreamEventType = "text_end"
+
+	// Thinking/reasoning streaming
+	StreamEventThinkingStart StreamEventType = "thinking_start"
+	StreamEventThinkingDelta StreamEventType = "thinking_delta"
+	StreamEventThinkingEnd   StreamEventType = "thinking_end"
+
+	// Tool call streaming
+	StreamEventToolCallStart StreamEventType = "toolcall_start"
+	StreamEventToolCallDelta StreamEventType = "toolcall_delta"
+	StreamEventToolCallEnd   StreamEventType = "toolcall_end"
+
+	// Terminal events
+	StreamEventDone  StreamEventType = "done"
+	StreamEventError StreamEventType = "error"
+)
+
+// StreamEvent is a streaming event from the LLM.
+type StreamEvent struct {
+	Type         StreamEventType
+	ContentIndex int        // which content block is being updated
+	Delta        string     // text/thinking/toolcall argument delta
+	Message      Message    // partial (during streaming) or final (done)
+	StopReason   StopReason // finish reason (for done events)
+	Err          error      // for error events
+}
+
+// ---------------------------------------------------------------------------
+// Queue Mode
+// ---------------------------------------------------------------------------
+
+// QueueMode controls how steering/follow-up queues are drained.
+type QueueMode string
+
+const (
+	QueueModeAll        QueueMode = "all"
+	QueueModeOneAtATime QueueMode = "one-at-a-time"
+)

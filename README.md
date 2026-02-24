@@ -10,6 +10,10 @@
 go get github.com/voocel/agentcore
 ```
 
+## Design Philosophy
+
+A restrained core with open extensibility tends to be more reliable than a complex all-in-one solution. Fewer built-ins, more possibilities.
+
 ## Architecture
 
 ```
@@ -236,11 +240,23 @@ agent := agentcore.NewAgent(
 | `WithSystemPrompt(s)` | Set system prompt |
 | `WithTools(t...)` | Set tool list |
 | `WithMaxTurns(n)` | Safety limit (default: 10) |
+| `WithMaxRetries(n)` | LLM call retry limit (default: 3) |
+| `WithMaxRetryDelay(d)` | Cap on retry wait time (default: 60s) |
+| `WithMaxToolErrors(n)` | Circuit breaker threshold per tool (default: 3) |
 | `WithStreamFn(fn)` | Custom LLM call function |
 | `WithTransformContext(fn)` | Context transform (stage 1) |
 | `WithConvertToLLM(fn)` | Message conversion (stage 2) |
-| `WithSteeringMode(m)` | Queue drain mode: `"all"` or `"one-at-a-time"` |
-| `WithFollowUpMode(m)` | Queue drain mode: `"all"` or `"one-at-a-time"` |
+| `WithContextPipeline(t,c)` | Set both stages in one call |
+| `WithThinkingLevel(l)` | Reasoning depth: `off` / `low` / `medium` / `high` |
+| `WithThinkingBudgets(m)` | Per-level thinking token budgets |
+| `WithSteeringMode(m)` | Queue drain mode: `all` or `one-at-a-time` |
+| `WithFollowUpMode(m)` | Queue drain mode: `all` or `one-at-a-time` |
+| `WithPermission(fn)` | Pre-execution permission check |
+| `WithMiddlewares(mw...)` | Tool execution middleware chain |
+| `WithContextWindow(n)` | Context window size for usage tracking |
+| `WithContextEstimate(fn)` | Token estimation function |
+| `WithGetApiKey(fn)` | Dynamic API key resolver |
+| `WithSessionID(id)` | Provider-level session caching |
 
 ## License
 

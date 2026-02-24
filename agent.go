@@ -2,6 +2,7 @@ package agentcore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -42,6 +43,7 @@ type Agent struct {
 	thinkingBudgets   map[ThinkingLevel]int
 	sessionID         string
 	middlewares       []ToolMiddleware
+	maxRetryDelay    time.Duration
 
 	// State
 	messages         []AgentMessage
@@ -386,7 +388,8 @@ func (a *Agent) buildConfig() LoopConfig {
 			defer a.mu.Unlock()
 			return dequeue(&a.followUpQ, a.followUpMode)
 		},
-		Middlewares: a.middlewares,
+		MaxRetryDelay: a.maxRetryDelay,
+		Middlewares:    a.middlewares,
 	}
 }
 
@@ -460,11 +463,10 @@ func (a *Agent) consumeLoop(events <-chan Event) {
 				}
 			}
 
-		// Error — construct fallback assistant message
+		// Error — construct fallback assistant message (skip for intentional abort)
 		case EventError:
-			if ev.Err != nil {
+			if ev.Err != nil && !errors.Is(ev.Err, context.Canceled) {
 				a.lastError = ev.Err.Error()
-				// Construct error fallback message
 				errMsg := Message{
 					Role:       RoleAssistant,
 					StopReason: StopReasonError,

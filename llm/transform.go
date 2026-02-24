@@ -37,9 +37,7 @@ func TransformMessages(messages []Message, targetProvider string) []Message {
 	}
 
 	// Pass 2: apply ID mapping to tool results, handle orphans
-	if len(idMap) > 0 {
-		result = applyIDMapping(result, idMap)
-	}
+	result = applyIDMapping(result, idMap)
 
 	return result
 }

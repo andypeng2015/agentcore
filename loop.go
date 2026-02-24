@@ -11,6 +11,7 @@ import (
 )
 
 const defaultMaxTurns = 10
+const defaultMaxRetryDelay = 60 * time.Second
 
 // AgentLoop starts an agent loop with new prompt messages.
 // Prompts are added to context and events are emitted for them.
@@ -231,7 +232,7 @@ func callLLMWithRetry(ctx context.Context, agentCtx *AgentContext, config LoopCo
 			return Message{}, err
 		}
 
-		delay := retryDelay(err, attempt)
+		delay := retryDelay(err, attempt, config.MaxRetryDelay)
 
 		emit(ch, Event{
 			Type: EventRetry,
@@ -279,20 +280,23 @@ func recoverOverflow(ctx context.Context, agentCtx *AgentContext, config LoopCon
 	return callLLM(ctx, agentCtx, config, ch)
 }
 
-// retryDelay calculates the wait duration using exponential backoff,
-// capped at 30s. Respects Retry-After from rate limit errors.
-func retryDelay(err error, attempt int) time.Duration {
+// retryDelay calculates the wait duration using exponential backoff.
+// Respects Retry-After from rate limit errors. Capped at maxDelay.
+func retryDelay(err error, attempt int, maxDelay time.Duration) time.Duration {
+	if maxDelay <= 0 {
+		maxDelay = defaultMaxRetryDelay
+	}
 	if after := litellm.GetRetryAfter(err); after > 0 {
 		d := time.Duration(after) * time.Second
-		if d > 30*time.Second {
-			d = 30 * time.Second
+		if d > maxDelay {
+			d = maxDelay
 		}
 		return d
 	}
-	// Exponential backoff: 1s, 2s, 4s, 8s... capped at 30s
+	// Exponential backoff: 1s, 2s, 4s, 8s...
 	d := time.Duration(math.Pow(2, float64(attempt))) * time.Second
-	if d > 30*time.Second {
-		d = 30 * time.Second
+	if d > maxDelay {
+		d = maxDelay
 	}
 	return d
 }

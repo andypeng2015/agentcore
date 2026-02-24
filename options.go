@@ -1,6 +1,9 @@
 package agentcore
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // AgentOption configures an Agent.
 type AgentOption func(*Agent)
@@ -106,6 +109,13 @@ func WithThinkingBudgets(budgets map[ThinkingLevel]int) AgentOption {
 // Forwarded to providers that support session-based prompt caching.
 func WithSessionID(id string) AgentOption {
 	return func(a *Agent) { a.sessionID = id }
+}
+
+// WithMaxRetryDelay caps the wait time between LLM retries.
+// Applies to both exponential backoff and server-requested Retry-After delays.
+// Default: 60s.
+func WithMaxRetryDelay(d time.Duration) AgentOption {
+	return func(a *Agent) { a.maxRetryDelay = d }
 }
 
 // WithMiddlewares sets tool execution middlewares.

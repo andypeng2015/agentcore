@@ -10,6 +10,10 @@
 go get github.com/voocel/agentcore
 ```
 
+## 设计哲学
+
+克制的内核，开放的扩展，往往比面面俱到的一体化更可靠。越少的内置，越多的可能。
+
 ## 架构
 
 ```
@@ -236,11 +240,23 @@ agent := agentcore.NewAgent(
 | `WithSystemPrompt(s)` | 设置系统提示词 |
 | `WithTools(t...)` | 设置工具列表 |
 | `WithMaxTurns(n)` | 安全上限（默认 10） |
+| `WithMaxRetries(n)` | LLM 调用重试次数（默认 3） |
+| `WithMaxRetryDelay(d)` | 重试等待上限（默认 60s） |
+| `WithMaxToolErrors(n)` | 工具熔断阈值（默认 3） |
 | `WithStreamFn(fn)` | 自定义 LLM 调用函数 |
 | `WithTransformContext(fn)` | 上下文变换（阶段 1） |
 | `WithConvertToLLM(fn)` | 消息转换（阶段 2） |
-| `WithSteeringMode(m)` | 队列出队模式：`"all"` 或 `"one-at-a-time"` |
-| `WithFollowUpMode(m)` | 队列出队模式：`"all"` 或 `"one-at-a-time"` |
+| `WithContextPipeline(t,c)` | 一次设置两个阶段 |
+| `WithThinkingLevel(l)` | 推理深度：`off` / `low` / `medium` / `high` |
+| `WithThinkingBudgets(m)` | 按级别设置 thinking token 预算 |
+| `WithSteeringMode(m)` | 队列出队模式：`all` 或 `one-at-a-time` |
+| `WithFollowUpMode(m)` | 队列出队模式：`all` 或 `one-at-a-time` |
+| `WithPermission(fn)` | 工具执行前权限检查 |
+| `WithMiddlewares(mw...)` | 工具执行中间件链 |
+| `WithContextWindow(n)` | 上下文窗口大小（用于用量追踪） |
+| `WithContextEstimate(fn)` | Token 估算函数 |
+| `WithGetApiKey(fn)` | 动态 API Key 解析器 |
+| `WithSessionID(id)` | 提供商级会话缓存 |
 
 ## 许可证
 
