@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/voocel/agentcore/schema"
@@ -21,21 +22,26 @@ func NewLs(workDir string) *LsTool { return &LsTool{WorkDir: workDir} }
 func (t *LsTool) Name() string  { return "ls" }
 func (t *LsTool) Label() string { return "List Directory" }
 func (t *LsTool) Description() string {
-	return "List directory contents. Returns file/directory names with sizes. Depth controls recursive listing (default 1, max 5)."
+	return fmt.Sprintf(
+		"List directory contents. Returns file/directory names with sizes, sorted alphabetically. Depth controls recursive listing (default 1, max 5). Output truncated to %d entries or %s.",
+		lsDefaultLimit, formatSize(defaultMaxBytes),
+	)
 }
 func (t *LsTool) Schema() map[string]any {
 	return schema.Object(
 		schema.Property("path", schema.String("Directory path (default: working directory)")),
 		schema.Property("depth", schema.Int("Recursion depth (default: 1, max: 5)")),
+		schema.Property("limit", schema.Int("Maximum entries to return (default: 500)")),
 	)
 }
 
 type lsArgs struct {
 	Path  string `json:"path"`
 	Depth int    `json:"depth"`
+	Limit int    `json:"limit"`
 }
 
-const lsMaxEntries = 200
+const lsDefaultLimit = 500
 
 func (t *LsTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	var a lsArgs
@@ -43,14 +49,7 @@ func (t *LsTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMes
 		return nil, fmt.Errorf("invalid args: %w", err)
 	}
 
-	dir := t.WorkDir
-	if a.Path != "" {
-		if filepath.IsAbs(a.Path) {
-			dir = a.Path
-		} else {
-			dir = filepath.Join(t.WorkDir, a.Path)
-		}
-	}
+	dir := ResolvePath(t.WorkDir, a.Path)
 
 	depth := a.Depth
 	if depth <= 0 {
@@ -60,11 +59,16 @@ func (t *LsTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMes
 		depth = 5
 	}
 
+	maxEntries := a.Limit
+	if maxEntries <= 0 {
+		maxEntries = lsDefaultLimit
+	}
+
 	var entries []string
 	count := 0
 
 	err := walkDepth(ctx, dir, dir, 0, depth, func(rel string, info os.FileInfo, isDir bool) bool {
-		if count >= lsMaxEntries {
+		if count >= maxEntries {
 			return false
 		}
 		count++
@@ -85,9 +89,20 @@ func (t *LsTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMes
 		return json.Marshal("(empty directory)")
 	}
 
+	// Sort alphabetically (case-insensitive)
+	sort.Slice(entries, func(i, j int) bool {
+		return strings.ToLower(entries[i]) < strings.ToLower(entries[j])
+	})
+
 	result := strings.Join(entries, "\n")
-	if count >= lsMaxEntries {
-		result += fmt.Sprintf("\n\n[Listing truncated at %d entries. Use a specific subdirectory or lower depth.]", lsMaxEntries)
+	if count >= maxEntries {
+		result += fmt.Sprintf("\n\n[Listing truncated at %d entries. Use limit=%d for more, or use a specific subdirectory.]", maxEntries, maxEntries*2)
+	}
+
+	// Apply byte truncation
+	tr := truncateHead(result, 0, defaultMaxBytes)
+	if tr.Truncated {
+		return json.Marshal(tr.Content + "\n\n[Output truncated at " + formatSize(defaultMaxBytes) + ".]")
 	}
 	return json.Marshal(result)
 }
@@ -107,7 +122,7 @@ func walkDepth(ctx context.Context, root, dir string, current, maxDepth int, fn 
 
 	for _, e := range dirEntries {
 		name := e.Name()
-		if name == ".git" || name == "node_modules" || name == "__pycache__" || name == ".venv" {
+		if IsSkipDir(name) {
 			continue
 		}
 

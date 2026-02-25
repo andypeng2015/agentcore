@@ -12,9 +12,11 @@ import (
 
 // EditTool performs exact string replacement in a file.
 // Supports line ending normalization, fuzzy matching, and returns unified diff.
-type EditTool struct{}
+type EditTool struct {
+	WorkDir string
+}
 
-func NewEdit() *EditTool { return &EditTool{} }
+func NewEdit(workDir string) *EditTool { return &EditTool{WorkDir: workDir} }
 
 func (t *EditTool) Name() string  { return "edit" }
 func (t *EditTool) Label() string { return "Edit File" }
@@ -40,6 +42,8 @@ func (t *EditTool) Execute(_ context.Context, args json.RawMessage) (json.RawMes
 	if err := json.Unmarshal(args, &a); err != nil {
 		return nil, fmt.Errorf("invalid args: %w", err)
 	}
+
+	a.Path = ResolvePath(t.WorkDir, a.Path)
 
 	data, err := os.ReadFile(a.Path)
 	if err != nil {
@@ -123,7 +127,7 @@ func restoreLineEndings(text, ending string) string {
 	return text
 }
 
-// --- Fuzzy matching (matching pi's edit-diff.ts) ---
+// --- Fuzzy matching ---
 
 // normalizeForFuzzy strips trailing whitespace per line, normalizes smart quotes,
 // Unicode dashes, and special spaces to ASCII equivalents.
@@ -147,8 +151,8 @@ func normalizeForFuzzy(text string) string {
 		text = strings.ReplaceAll(text, string(r), "-")
 	}
 
-	// Special spaces → regular space
-	for _, r := range []rune{'\u00A0', '\u2002', '\u2003', '\u2004', '\u2005', '\u2006', '\u2007', '\u2008', '\u2009', '\u200A', '\u202F', '\u205F', '\u3000'} {
+	// Special spaces → regular space (reuse shared unicodeSpaces from path.go)
+	for _, r := range unicodeSpaces {
 		text = strings.ReplaceAll(text, string(r), " ")
 	}
 
@@ -175,7 +179,7 @@ func fuzzyFind(content, oldText string) (index, matchLen int, baseContent string
 	return -1, 0, content
 }
 
-// --- Diff generation (matching pi's generateDiffString) ---
+// --- Diff generation ---
 
 // generateDiff produces a unified diff with line numbers and context.
 func generateDiff(oldContent, newContent string) (string, int) {

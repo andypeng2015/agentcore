@@ -63,6 +63,7 @@ func (t *BashTool) Execute(ctx context.Context, args json.RawMessage) (json.RawM
 	if t.WorkDir != "" {
 		cmd.Dir = t.WorkDir
 	}
+	configureProcGroup(cmd)
 
 	// Use OS pipe so that cmd.Wait() returns as soon as the shell process
 	// exits, without blocking on I/O from background subprocesses that
@@ -125,15 +126,29 @@ func (t *BashTool) Execute(ctx context.Context, args json.RawMessage) (json.RawM
 		}
 	}
 
-	// Apply tail truncation
-	truncated, totalLines, outputLines, wasTruncated := truncateTail(outStr, defaultMaxLines, defaultMaxBytes)
-	if wasTruncated {
-		startLine := totalLines - outputLines + 1
-		truncated += fmt.Sprintf("\n\n[Showing lines %d-%d of %d.]", startLine, totalLines, totalLines)
-	}
-	if exitCode != 0 {
-		truncated += fmt.Sprintf("\n\nCommand exited with code %d", exitCode)
+	// Save full output to temp file when it will be truncated
+	var tempPath string
+	if len(outStr) > defaultMaxBytes {
+		if f, err := os.CreateTemp("", "agentcore-bash-*.log"); err == nil {
+			f.WriteString(outStr)
+			tempPath = f.Name()
+			f.Close()
+		}
 	}
 
-	return json.Marshal(truncated)
+	// Apply tail truncation
+	tr := truncateTail(outStr, defaultMaxLines, defaultMaxBytes)
+	result := tr.Content
+	if tr.Truncated {
+		startLine := tr.TotalLines - tr.OutputLines + 1
+		result += fmt.Sprintf("\n\n[Showing lines %d-%d of %d.]", startLine, tr.TotalLines, tr.TotalLines)
+		if tempPath != "" {
+			result += fmt.Sprintf("\n[Full output saved to: %s]", tempPath)
+		}
+	}
+	if exitCode != 0 {
+		return nil, fmt.Errorf("%s\n\nCommand exited with code %d", result, exitCode)
+	}
+
+	return json.Marshal(result)
 }

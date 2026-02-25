@@ -11,9 +11,11 @@ import (
 )
 
 // WriteTool writes content to a file, creating directories as needed.
-type WriteTool struct{}
+type WriteTool struct {
+	WorkDir string
+}
 
-func NewWrite() *WriteTool { return &WriteTool{} }
+func NewWrite(workDir string) *WriteTool { return &WriteTool{WorkDir: workDir} }
 
 func (t *WriteTool) Name() string  { return "write" }
 func (t *WriteTool) Label() string { return "Write File" }
@@ -35,6 +37,8 @@ func (t *WriteTool) Execute(_ context.Context, args json.RawMessage) (json.RawMe
 	if err := json.Unmarshal(args, &a); err != nil {
 		return nil, fmt.Errorf("invalid args: %w", err)
 	}
+
+	a.Path = ResolvePath(t.WorkDir, a.Path)
 
 	if err := os.MkdirAll(filepath.Dir(a.Path), 0o755); err != nil {
 		return nil, fmt.Errorf("mkdir: %w", err)

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/voocel/litellm"
@@ -535,26 +536,49 @@ func executeToolCalls(ctx context.Context, tools []Tool, calls []ToolCall, confi
 				})
 			})
 
-			var output json.RawMessage
-			var execErr error
-			if len(config.Middlewares) > 0 {
-				exec := buildMiddlewareChain(tool, call, config.Middlewares)
-				output, execErr = exec(progressCtx, call.Args)
-			} else {
-				output, execErr = tool.Execute(progressCtx, call.Args)
-			}
-			err := execErr
-			if err != nil {
-				errContent, _ := json.Marshal(err.Error())
-				result = ToolResult{
-					ToolCallID: call.ID,
-					Content:    errContent,
-					IsError:    true,
+			// ContentTool: returns rich content blocks (e.g., images).
+			// Bypasses middleware chain because middleware signature
+			// (json.RawMessage, error) does not accommodate []ContentBlock.
+			if ct, ok := tool.(ContentTool); ok {
+				blocks, execErr := ct.ExecuteContent(progressCtx, call.Args)
+				if execErr != nil {
+					errContent, _ := json.Marshal(execErr.Error())
+					result = ToolResult{
+						ToolCallID: call.ID,
+						Content:    errContent,
+						IsError:    true,
+					}
+				} else {
+					// Extract text summary for Event.Result so consumers
+					// can inspect output without parsing ContentBlocks.
+					summary := contentBlocksTextSummary(blocks)
+					result = ToolResult{
+						ToolCallID:    call.ID,
+						Content:       summary,
+						ContentBlocks: blocks,
+					}
 				}
 			} else {
-				result = ToolResult{
-					ToolCallID: call.ID,
-					Content:    output,
+				var output json.RawMessage
+				var execErr error
+				if len(config.Middlewares) > 0 {
+					exec := buildMiddlewareChain(tool, call, config.Middlewares)
+					output, execErr = exec(progressCtx, call.Args)
+				} else {
+					output, execErr = tool.Execute(progressCtx, call.Args)
+				}
+				if execErr != nil {
+					errContent, _ := json.Marshal(execErr.Error())
+					result = ToolResult{
+						ToolCallID: call.ID,
+						Content:    errContent,
+						IsError:    true,
+					}
+				} else {
+					result = ToolResult{
+						ToolCallID: call.ID,
+						Content:    output,
+					}
 				}
 			}
 		}
@@ -626,6 +650,17 @@ func skipToolCall(call ToolCall, tools []Tool, ch chan<- Event) ToolResult {
 
 // toolResultToMessage converts a ToolResult into a Message for the context.
 func toolResultToMessage(tr ToolResult) Message {
+	if len(tr.ContentBlocks) > 0 {
+		return Message{
+			Role:    RoleTool,
+			Content: tr.ContentBlocks,
+			Metadata: map[string]any{
+				"tool_call_id": tr.ToolCallID,
+				"is_error":     tr.IsError,
+			},
+			Timestamp: time.Now(),
+		}
+	}
 	return ToolResultMsg(tr.ToolCallID, tr.Content, tr.IsError)
 }
 
@@ -785,4 +820,20 @@ func copyMessages(msgs []AgentMessage) []AgentMessage {
 	out := make([]AgentMessage, len(msgs))
 	copy(out, msgs)
 	return out
+}
+
+// contentBlocksTextSummary extracts text from ContentBlocks as a JSON string
+// for the Event.Result field. Returns nil if no text content.
+func contentBlocksTextSummary(blocks []ContentBlock) json.RawMessage {
+	var texts []string
+	for _, b := range blocks {
+		if b.Type == ContentText {
+			texts = append(texts, b.Text)
+		}
+	}
+	if len(texts) == 0 {
+		return nil
+	}
+	summary, _ := json.Marshal(strings.Join(texts, "\n"))
+	return summary
 }
