@@ -114,6 +114,7 @@ type CallConfig struct {
 	ThinkingBudget int    // max thinking tokens, 0 = use provider default
 	APIKey         string // per-call API key override, empty = use model default
 	SessionID      string // provider session caching identifier
+	MaxTokens      int    // per-call max tokens override, 0 = use model default
 }
 
 // ResolveCallConfig applies options and returns the resolved config.
@@ -144,6 +145,11 @@ func WithAPIKey(key string) CallOption {
 // WithCallSessionID sets a session identifier for a single LLM call.
 func WithCallSessionID(id string) CallOption {
 	return func(c *CallConfig) { c.SessionID = id }
+}
+
+// WithMaxTokens overrides the max output tokens for a single LLM call.
+func WithMaxTokens(tokens int) CallOption {
+	return func(c *CallConfig) { c.MaxTokens = tokens }
 }
 
 // ---------------------------------------------------------------------------

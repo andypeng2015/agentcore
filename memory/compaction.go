@@ -89,20 +89,64 @@ func NewCompaction(cfg CompactionConfig) func(context.Context, []agentcore.Agent
 			}
 		}
 
-		// Generate history summary
-		summary, err := generateSummary(ctx, cfg.Model, toSummarize, previousSummary)
-		if err != nil {
-			return nil, fmt.Errorf("compaction: %w", err)
+		// Call options: history gets higher budget + thinking, prefix gets smaller budget
+		historyOpts := []agentcore.CallOption{
+			agentcore.WithMaxTokens(int(float64(cfg.ReserveTokens) * 0.8)),
+			agentcore.WithThinking(agentcore.ThinkingHigh),
+		}
+		prefixOpts := []agentcore.CallOption{
+			agentcore.WithMaxTokens(int(float64(cfg.ReserveTokens) * 0.5)),
 		}
 
-		// If split turn, generate turn prefix summary and merge
-		if cut.isSplitTurn && cut.turnStartIndex >= 0 {
-			turnPrefix := msgs[cut.turnStartIndex:cut.firstKeptIndex]
-			if len(turnPrefix) > 0 {
-				prefixSummary, err := generateTurnPrefixSummary(ctx, cfg.Model, turnPrefix)
-				if err == nil && prefixSummary != "" {
-					summary += "\n\n---\n\n**Turn Context (split turn):**\n\n" + prefixSummary
+		var summary string
+
+		needTurnPrefix := cut.isSplitTurn && cut.turnStartIndex >= 0
+		var turnPrefix []agentcore.AgentMessage
+		if needTurnPrefix {
+			turnPrefix = msgs[cut.turnStartIndex:cut.firstKeptIndex]
+			needTurnPrefix = len(turnPrefix) > 0
+		}
+
+		if needTurnPrefix {
+			// Generate history + turn prefix summaries in parallel
+			type summaryResult struct {
+				text string
+				err  error
+			}
+			historyCh := make(chan summaryResult, 1)
+			prefixCh := make(chan summaryResult, 1)
+
+			go func() {
+				if len(toSummarize) == 0 {
+					historyCh <- summaryResult{text: "No prior history."}
+					return
 				}
+				s, e := generateSummary(ctx, cfg.Model, toSummarize, previousSummary, historyOpts...)
+				historyCh <- summaryResult{s, e}
+			}()
+			go func() {
+				s, e := generateTurnPrefixSummary(ctx, cfg.Model, turnPrefix, prefixOpts...)
+				prefixCh <- summaryResult{s, e}
+			}()
+
+			hr := <-historyCh
+			pr := <-prefixCh
+
+			if hr.err != nil {
+				return nil, fmt.Errorf("compaction: %w", hr.err)
+			}
+			if pr.err != nil {
+				return nil, fmt.Errorf("compaction turn prefix: %w", pr.err)
+			}
+			summary = hr.text
+			if pr.text != "" {
+				summary += "\n\n---\n\n**Turn Context (split turn):**\n\n" + pr.text
+			}
+		} else {
+			var err error
+			summary, err = generateSummary(ctx, cfg.Model, toSummarize, previousSummary, historyOpts...)
+			if err != nil {
+				return nil, fmt.Errorf("compaction: %w", err)
 			}
 		}
 

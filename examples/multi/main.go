@@ -34,7 +34,7 @@ func main() {
 		Model:        scoutModel,
 		SystemPrompt: "You are a scout agent. Quickly explore the codebase and report what you find. Be concise.",
 		Tools: []agentcore.Tool{
-			tools.NewRead(),
+			tools.NewRead("."),
 			tools.NewBash("."),
 		},
 		MaxTurns: 5,
@@ -46,7 +46,7 @@ func main() {
 		Model:        mainModel,
 		SystemPrompt: "You are a code reviewer. Review the code and provide constructive feedback on quality, style, and correctness.",
 		Tools: []agentcore.Tool{
-			tools.NewRead(),
+			tools.NewRead("."),
 			tools.NewBash("."),
 		},
 		MaxTurns: 5,
@@ -62,9 +62,9 @@ func main() {
 				"You can use chain mode to scout first, then review based on findings.",
 		),
 		agentcore.WithTools(
-			tools.NewRead(),
-			tools.NewWrite(),
-			tools.NewEdit(),
+			tools.NewRead("."),
+			tools.NewWrite("."),
+			tools.NewEdit("."),
 			tools.NewBash("."),
 			agentcore.NewSubAgentTool(scout, reviewer),
 		),

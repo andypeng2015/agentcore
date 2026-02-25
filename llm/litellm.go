@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 
 	"github.com/voocel/agentcore"
 	"github.com/voocel/litellm"
@@ -111,6 +110,7 @@ func (l *LiteLLMAdapter) Generate(ctx context.Context, messages []agentcore.Mess
 }
 
 // GenerateStream produces a streaming response with fine-grained events.
+// Delegates lifecycle detection to litellm's CollectStreamWithCallbacks.
 func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []agentcore.Message, tools []agentcore.ToolSpec, opts ...agentcore.CallOption) (<-chan agentcore.StreamEvent, error) {
 	cfg := l.GetConfig()
 	llmMessages := convertMessages(messages)
@@ -137,142 +137,85 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []agentcor
 		defer stream.Close()
 
 		var (
-			partial      = agentcore.Message{Role: agentcore.RoleAssistant}
-			textStarted  bool
-			thinkStarted bool
-			finishReason string
-			toolAcc      = litellm.NewToolCallAccumulator()
-			toolStarted  = make(map[int]bool)
-			streamUsage  *litellm.Usage // captured from the last chunk
+			partial  = agentcore.Message{Role: agentcore.RoleAssistant}
+			textIdx  = -1
+			thinkIdx = -1
 		)
 
-		for {
-			chunk, err := stream.Next()
-			if err != nil {
-				if err == io.EOF {
-					break
-				}
-				eventChan <- agentcore.StreamEvent{Type: agentcore.StreamEventError, Err: err}
-				return
-			}
-			if chunk == nil {
-				continue
-			}
-
-			// Stream completed — break to emit final events.
-			if chunk.Done {
-				if chunk.Usage != nil && chunk.Usage.TotalTokens > 0 {
-					streamUsage = chunk.Usage
-				}
-				break
-			}
-
-			// Reasoning/thinking chunks
-			if chunk.Reasoning != nil && chunk.Reasoning.Content != "" {
-				if !thinkStarted {
-					thinkStarted = true
-					partial.Content = append(partial.Content, agentcore.ThinkingBlock(""))
-					idx := len(partial.Content) - 1
-					eventChan <- agentcore.StreamEvent{
-						Type:         agentcore.StreamEventThinkingStart,
-						ContentIndex: idx,
-						Message:      partial,
-					}
-				}
-				idx := lastBlockIndex(partial.Content, agentcore.ContentThinking)
-				partial.Content[idx].Thinking += chunk.Reasoning.Content
+		resp, err := litellm.CollectStreamWithCallbacks(stream, litellm.StreamCallbacks{
+			OnReasoningStart: func() {
+				partial.Content = append(partial.Content, agentcore.ThinkingBlock(""))
+				thinkIdx = len(partial.Content) - 1
 				eventChan <- agentcore.StreamEvent{
-					Type:         agentcore.StreamEventThinkingDelta,
-					ContentIndex: idx,
-					Delta:        chunk.Reasoning.Content,
+					Type:         agentcore.StreamEventThinkingStart,
+					ContentIndex: thinkIdx,
 					Message:      partial,
 				}
-			}
-
-			// Text content chunks
-			if chunk.Content != "" {
-				if !textStarted {
-					textStarted = true
-					partial.Content = append(partial.Content, agentcore.TextBlock(""))
-					idx := len(partial.Content) - 1
-					eventChan <- agentcore.StreamEvent{
-						Type:         agentcore.StreamEventTextStart,
-						ContentIndex: idx,
-						Message:      partial,
-					}
+			},
+			OnReasoning: func(chunk *litellm.ReasoningChunk) {
+				if chunk.Content == "" {
+					return
 				}
-				idx := lastBlockIndex(partial.Content, agentcore.ContentText)
-				partial.Content[idx].Text += chunk.Content
+				partial.Content[thinkIdx].Thinking += chunk.Content
 				eventChan <- agentcore.StreamEvent{
-					Type:         agentcore.StreamEventTextDelta,
-					ContentIndex: idx,
+					Type:         agentcore.StreamEventThinkingDelta,
+					ContentIndex: thinkIdx,
 					Delta:        chunk.Content,
 					Message:      partial,
 				}
-			}
-
-			// Tool call deltas
-			if chunk.ToolCallDelta != nil {
-				deltaIdx := chunk.ToolCallDelta.Index
-				wasStarted := toolAcc.Started(deltaIdx)
-				toolAcc.Apply(chunk.ToolCallDelta)
-
-				if !wasStarted && !toolStarted[deltaIdx] {
-					toolStarted[deltaIdx] = true
-					eventChan <- agentcore.StreamEvent{
-						Type:    agentcore.StreamEventToolCallStart,
-						Message: partial,
-					}
-				}
-
-				if chunk.ToolCallDelta.ArgumentsDelta != "" {
-					eventChan <- agentcore.StreamEvent{
-						Type:    agentcore.StreamEventToolCallDelta,
-						Delta:   chunk.ToolCallDelta.ArgumentsDelta,
-						Message: partial,
-					}
-				}
-			}
-
-			if chunk.FinishReason != "" {
-				finishReason = chunk.FinishReason
-			}
-
-			// Capture usage from the last chunk that carries it
-			if chunk.Usage != nil && chunk.Usage.TotalTokens > 0 {
-				streamUsage = chunk.Usage
-			}
-		}
-
-		// Emit end events for open blocks
-		if thinkStarted {
-			idx := lastBlockIndex(partial.Content, agentcore.ContentThinking)
-			if idx >= 0 {
+			},
+			OnReasoningEnd: func(content string) {
 				eventChan <- agentcore.StreamEvent{
 					Type:         agentcore.StreamEventThinkingEnd,
-					ContentIndex: idx,
+					ContentIndex: thinkIdx,
 					Message:      partial,
 				}
-			}
-		}
-		if textStarted {
-			idx := lastBlockIndex(partial.Content, agentcore.ContentText)
-			if idx >= 0 {
+			},
+			OnContentStart: func() {
+				partial.Content = append(partial.Content, agentcore.TextBlock(""))
+				textIdx = len(partial.Content) - 1
+				eventChan <- agentcore.StreamEvent{
+					Type:         agentcore.StreamEventTextStart,
+					ContentIndex: textIdx,
+					Message:      partial,
+				}
+			},
+			OnContent: func(delta string) {
+				partial.Content[textIdx].Text += delta
+				eventChan <- agentcore.StreamEvent{
+					Type:         agentcore.StreamEventTextDelta,
+					ContentIndex: textIdx,
+					Delta:        delta,
+					Message:      partial,
+				}
+			},
+			OnContentEnd: func(content string) {
 				eventChan <- agentcore.StreamEvent{
 					Type:         agentcore.StreamEventTextEnd,
-					ContentIndex: idx,
+					ContentIndex: textIdx,
 					Message:      partial,
 				}
-			}
-		}
-
-		// Build final tool calls from accumulated deltas
-		if calls := toolAcc.Build(); len(calls) > 0 {
-			for _, tc := range calls {
+			},
+			OnToolCallStart: func(delta *litellm.ToolCallDelta) {
+				eventChan <- agentcore.StreamEvent{
+					Type:    agentcore.StreamEventToolCallStart,
+					Message: partial,
+				}
+			},
+			OnToolCall: func(delta *litellm.ToolCallDelta) {
+				if delta.ArgumentsDelta != "" {
+					eventChan <- agentcore.StreamEvent{
+						Type:    agentcore.StreamEventToolCallDelta,
+						Delta:   delta.ArgumentsDelta,
+						Message: partial,
+					}
+				}
+			},
+			OnToolCallEnd: func(call litellm.ToolCall) {
 				partial.Content = append(partial.Content, agentcore.ToolCallBlock(agentcore.ToolCall{
-					ID:   tc.ID,
-					Name: tc.Function.Name,
-					Args: safeArgs(tc.Function.Arguments),
+					ID:   call.ID,
+					Name: call.Function.Name,
+					Args: safeArgs(call.Function.Arguments),
 				}))
 				idx := len(partial.Content) - 1
 				eventChan <- agentcore.StreamEvent{
@@ -280,36 +223,32 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []agentcor
 					ContentIndex: idx,
 					Message:      partial,
 				}
-			}
+			},
+		})
+
+		if err != nil {
+			eventChan <- agentcore.StreamEvent{Type: agentcore.StreamEventError, Err: err}
+			return
 		}
 
-		// Attach usage from stream to the final message
-		if streamUsage != nil && streamUsage.TotalTokens > 0 {
+		// Map usage from collected response
+		if resp != nil && resp.Usage.TotalTokens > 0 {
 			partial.Usage = &agentcore.Usage{
-				Input:       streamUsage.PromptTokens,
-				Output:      streamUsage.CompletionTokens,
-				CacheRead:   streamUsage.CacheReadInputTokens,
-				CacheWrite:  streamUsage.CacheCreationInputTokens,
-				TotalTokens: streamUsage.TotalTokens,
+				Input:       resp.Usage.PromptTokens,
+				Output:      resp.Usage.CompletionTokens,
+				CacheRead:   resp.Usage.CacheReadInputTokens,
+				CacheWrite:  resp.Usage.CacheCreationInputTokens,
+				TotalTokens: resp.Usage.TotalTokens,
 			}
 			partial.Usage.Cost = CalculateCost(l.Info().Pricing, partial.Usage)
 		}
-
-		partial.StopReason = mapStopReason(finishReason)
+		if resp != nil {
+			partial.StopReason = mapStopReason(resp.FinishReason)
+		}
 		eventChan <- agentcore.StreamEvent{Type: agentcore.StreamEventDone, Message: partial, StopReason: partial.StopReason}
 	}()
 
 	return eventChan, nil
-}
-
-// lastBlockIndex returns the index of the last ContentBlock of the given type.
-func lastBlockIndex(blocks []agentcore.ContentBlock, ct agentcore.ContentType) int {
-	for i := len(blocks) - 1; i >= 0; i-- {
-		if blocks[i].Type == ct {
-			return i
-		}
-	}
-	return -1
 }
 
 // convertMessages converts agentcore.Message to litellm.Message.
@@ -470,6 +409,11 @@ func applyCallConfig(req *litellm.Request, opts []agentcore.CallOption) {
 			req.Extra = make(map[string]any)
 		}
 		req.Extra["session_id"] = callCfg.SessionID
+	}
+
+	// Per-request max tokens override
+	if callCfg.MaxTokens > 0 {
+		req.MaxTokens = &callCfg.MaxTokens
 	}
 }
 

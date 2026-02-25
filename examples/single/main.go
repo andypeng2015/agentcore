@@ -26,9 +26,9 @@ func main() {
 		agentcore.WithModel(model),
 		agentcore.WithSystemPrompt("You are a helpful coding assistant. Use the provided tools to help users."),
 		agentcore.WithTools(
-			tools.NewRead(),
-			tools.NewWrite(),
-			tools.NewEdit(),
+			tools.NewRead("."),
+			tools.NewWrite("."),
+			tools.NewEdit("."),
 			tools.NewBash("."),
 		),
 		agentcore.WithMaxTurns(20),

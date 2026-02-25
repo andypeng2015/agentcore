@@ -99,7 +99,7 @@ Summarize the prefix to provide context for the retained suffix:
 Be concise. Focus on what's needed to understand the kept suffix.`
 
 // generateTurnPrefixSummary generates a summary for the prefix portion of a split turn.
-func generateTurnPrefixSummary(ctx context.Context, model agentcore.ChatModel, msgs []agentcore.AgentMessage) (string, error) {
+func generateTurnPrefixSummary(ctx context.Context, model agentcore.ChatModel, msgs []agentcore.AgentMessage, opts ...agentcore.CallOption) (string, error) {
 	conversation := serializeConversation(msgs)
 	if conversation == "" {
 		return "", nil
@@ -110,7 +110,7 @@ func generateTurnPrefixSummary(ctx context.Context, model agentcore.ChatModel, m
 	resp, err := model.Generate(ctx, []agentcore.Message{
 		agentcore.SystemMsg(summarySystemPrompt),
 		agentcore.UserMsg(userPrompt),
-	}, nil)
+	}, nil, opts...)
 	if err != nil {
 		return "", fmt.Errorf("turn prefix summarization failed: %w", err)
 	}
@@ -119,7 +119,7 @@ func generateTurnPrefixSummary(ctx context.Context, model agentcore.ChatModel, m
 
 // generateSummary calls the ChatModel to produce a conversation summary.
 // If previousSummary is non-empty, uses incremental update prompt.
-func generateSummary(ctx context.Context, model agentcore.ChatModel, msgs []agentcore.AgentMessage, previousSummary string) (string, error) {
+func generateSummary(ctx context.Context, model agentcore.ChatModel, msgs []agentcore.AgentMessage, previousSummary string, opts ...agentcore.CallOption) (string, error) {
 	conversation := serializeConversation(msgs)
 	if conversation == "" {
 		return "", fmt.Errorf("no conversation content to summarize")
@@ -138,7 +138,7 @@ func generateSummary(ctx context.Context, model agentcore.ChatModel, msgs []agen
 	resp, err := model.Generate(ctx, []agentcore.Message{
 		agentcore.SystemMsg(summarySystemPrompt),
 		agentcore.UserMsg(userPrompt),
-	}, nil)
+	}, nil, opts...)
 	if err != nil {
 		return "", fmt.Errorf("summarization failed: %w", err)
 	}
@@ -186,6 +186,9 @@ func serializeConversation(msgs []agentcore.AgentMessage) string {
 					parts = append(parts, "[User]: "+text)
 				}
 			case agentcore.RoleAssistant:
+				if thinking := v.ThinkingContent(); thinking != "" {
+					parts = append(parts, "[Assistant thinking]: "+thinking)
+				}
 				if text := v.TextContent(); text != "" {
 					parts = append(parts, "[Assistant]: "+text)
 				}

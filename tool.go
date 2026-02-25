@@ -42,10 +42,11 @@ type ToolCall struct {
 
 // ToolResult represents a tool execution outcome.
 type ToolResult struct {
-	ToolCallID string          `json:"tool_call_id"`
-	Content    json.RawMessage `json:"content,omitempty"`
-	IsError    bool            `json:"is_error,omitempty"`
-	Details    any             `json:"details,omitempty"` // optional metadata for UI display/logging
+	ToolCallID    string           `json:"tool_call_id"`
+	Content       json.RawMessage  `json:"content,omitempty"`
+	ContentBlocks []ContentBlock   `json:"-"` // rich content (images); not serialized
+	IsError       bool             `json:"is_error,omitempty"`
+	Details       any              `json:"details,omitempty"` // optional metadata for UI display/logging
 }
 
 // ---------------------------------------------------------------------------
@@ -65,6 +66,14 @@ type Tool interface {
 // ToolLabeler is an optional interface for tools to provide a human-readable label.
 type ToolLabeler interface {
 	Label() string
+}
+
+// ContentTool is an optional interface for tools that return rich content
+// (e.g., images). When a tool implements ContentTool, the agent loop calls
+// ExecuteContent instead of Execute, enabling multi-block responses with
+// text + image content blocks.
+type ContentTool interface {
+	ExecuteContent(ctx context.Context, args json.RawMessage) ([]ContentBlock, error)
 }
 
 // PermissionFunc is called before each tool execution.

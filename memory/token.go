@@ -19,6 +19,8 @@ func EstimateTokens(msg agentcore.AgentMessage) int {
 				if b.ToolCall != nil {
 					chars += len(b.ToolCall.Name) + len(b.ToolCall.Args)
 				}
+			case agentcore.ContentImage:
+				chars += 4800 // ~1200 tokens
 			}
 		}
 	case CompactionSummary:
@@ -40,7 +42,7 @@ func EstimateTotal(msgs []agentcore.AgentMessage) int {
 }
 
 // ---------------------------------------------------------------------------
-// Hybrid context token estimation (mirrors pi-mono estimateContextTokens)
+// Hybrid context token estimation
 // ---------------------------------------------------------------------------
 
 // ContextUsageEstimate holds the hybrid token estimation result.
