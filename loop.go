@@ -524,15 +524,32 @@ func executeToolCalls(ctx context.Context, tools []Tool, calls []ToolCall, confi
 				IsError:    true,
 			}
 		} else {
+			// Preview: if tool supports it, compute and emit preview before execution.
+			// Preview runs only after args are validated.
+			if p, ok := tool.(Previewer); ok {
+				if preview, err := p.Preview(ctx, call.Args); err == nil {
+					emit(ch, Event{
+						Type:       EventToolExecUpdate,
+						ToolID:     call.ID,
+						Tool:       call.Name,
+						ToolLabel:  label,
+						Args:       call.Args,
+						Result:     preview,
+						UpdateKind: ToolExecUpdatePreview,
+					})
+				}
+			}
+
 			// Inject progress callback so tools can report partial results
 			progressCtx := WithToolProgress(ctx, func(partial json.RawMessage) {
 				emit(ch, Event{
-					Type:      EventToolExecUpdate,
-					ToolID:    call.ID,
-					Tool:      call.Name,
-					ToolLabel: label,
-					Args:      call.Args,
-					Result:    partial,
+					Type:       EventToolExecUpdate,
+					ToolID:     call.ID,
+					Tool:       call.Name,
+					ToolLabel:  label,
+					Args:       call.Args,
+					Result:     partial,
+					UpdateKind: ToolExecUpdateProgress,
 				})
 			})
 

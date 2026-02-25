@@ -49,15 +49,18 @@ import (
 )
 
 func main() {
-    model := llm.NewOpenAIModel("gpt-4.1-mini", os.Getenv("OPENAI_API_KEY"))
+    model, err := llm.NewOpenAIModel("gpt-5-mini", os.Getenv("OPENAI_API_KEY"))
+    if err != nil {
+        panic(err)
+    }
 
     agent := agentcore.NewAgent(
         agentcore.WithModel(model),
         agentcore.WithSystemPrompt("你是一个编程助手。"),
         agentcore.WithTools(
-            tools.NewRead(),
-            tools.NewWrite(),
-            tools.NewEdit(),
+            tools.NewRead("."),
+            tools.NewWrite("."),
+            tools.NewEdit("."),
             tools.NewBash("."),
         ),
     )
@@ -80,21 +83,23 @@ func main() {
 子 Agent 作为普通工具被调用，各自拥有隔离的上下文：
 
 ```go
+model, _ := llm.NewOpenAIModel("gpt-5-mini", apiKey)
+
 scout := agentcore.SubAgentConfig{
     Name:         "scout",
     Description:  "快速代码侦察",
-    Model:        llm.NewOpenAIModel("gpt-4.1-mini", apiKey),
+    Model:        model,
     SystemPrompt: "快速探索代码库并汇报发现。简洁明了。",
-    Tools:        []agentcore.Tool{tools.NewRead(), tools.NewBash(".")},
+    Tools:        []agentcore.Tool{tools.NewRead("."), tools.NewBash(".")},
     MaxTurns:     5,
 }
 
 worker := agentcore.SubAgentConfig{
     Name:         "worker",
     Description:  "通用执行者",
-    Model:        llm.NewOpenAIModel("gpt-4.1-mini", apiKey),
+    Model:        model,
     SystemPrompt: "执行分配给你的任务。",
-    Tools:        []agentcore.Tool{tools.NewRead(), tools.NewWrite(), tools.NewEdit(), tools.NewBash(".")},
+    Tools:        []agentcore.Tool{tools.NewRead("."), tools.NewWrite("."), tools.NewEdit("."), tools.NewBash(".")},
 }
 
 agent := agentcore.NewAgent(
@@ -120,10 +125,10 @@ LLM 通过工具调用触发三种执行模式：
 
 ```go
 // 中断：在当前工具执行完毕后注入，跳过剩余工具
-agent.Steer(agentcore.Message{Role: agentcore.RoleUser, Content: "停下来，改为专注于测试。"})
+agent.Steer(agentcore.UserMsg("停下来，改为专注于测试。"))
 
 // 续接：排队等 agent 完成后处理
-agent.FollowUp(agentcore.Message{Role: agentcore.RoleUser, Content: "现在运行测试。"})
+agent.FollowUp(agentcore.UserMsg("现在运行测试。"))
 
 // 立即取消
 agent.Abort()

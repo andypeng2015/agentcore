@@ -27,6 +27,14 @@ const (
 	EventError          EventType = "error"
 )
 
+// ToolExecUpdateKind distinguishes update payload semantics for tool_exec_update events.
+type ToolExecUpdateKind string
+
+const (
+	ToolExecUpdatePreview  ToolExecUpdateKind = "preview"
+	ToolExecUpdateProgress ToolExecUpdateKind = "progress"
+)
+
 // Event is a lifecycle event emitted by the agent loop.
 // This is the single output channel for all lifecycle information.
 type Event struct {
@@ -36,13 +44,14 @@ type Event struct {
 	ToolID      string          // for tool_exec_*
 	Tool        string          // tool name for tool_exec_*
 	ToolLabel   string          // human-readable tool label (from ToolLabeler)
-	Args        json.RawMessage // tool args for tool_exec_start
+	Args        json.RawMessage // tool args for tool_exec_start/tool_exec_update
 	Result      json.RawMessage // tool result for tool_exec_end/update
-	IsError     bool            // tool error flag for tool_exec_end
-	ToolResults []ToolResult    // for turn_end: all tool results from this turn
-	Err         error           // for error events
-	NewMessages []AgentMessage  // for agent_end: messages added during this loop
-	RetryInfo   *RetryInfo      // for retry events
+	UpdateKind  ToolExecUpdateKind
+	IsError     bool           // tool error flag for tool_exec_end
+	ToolResults []ToolResult   // for turn_end: all tool results from this turn
+	Err         error          // for error events
+	NewMessages []AgentMessage // for agent_end: messages added during this loop
+	RetryInfo   *RetryInfo     // for retry events
 }
 
 // RetryInfo carries retry context for EventRetry events.

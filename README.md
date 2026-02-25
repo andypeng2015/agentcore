@@ -49,15 +49,18 @@ import (
 )
 
 func main() {
-    model := llm.NewOpenAIModel("gpt-4.1-mini", os.Getenv("OPENAI_API_KEY"))
+    model, err := llm.NewOpenAIModel("gpt-5-mini", os.Getenv("OPENAI_API_KEY"))
+    if err != nil {
+        panic(err)
+    }
 
     agent := agentcore.NewAgent(
         agentcore.WithModel(model),
         agentcore.WithSystemPrompt("You are a helpful coding assistant."),
         agentcore.WithTools(
-            tools.NewRead(),
-            tools.NewWrite(),
-            tools.NewEdit(),
+            tools.NewRead("."),
+            tools.NewWrite("."),
+            tools.NewEdit("."),
             tools.NewBash("."),
         ),
     )
@@ -80,21 +83,23 @@ func main() {
 Sub-agents are invoked as regular tools with isolated contexts:
 
 ```go
+model, _ := llm.NewOpenAIModel("gpt-5-mini", apiKey)
+
 scout := agentcore.SubAgentConfig{
     Name:         "scout",
     Description:  "Fast codebase reconnaissance",
-    Model:        llm.NewOpenAIModel("gpt-4.1-mini", apiKey),
+    Model:        model,
     SystemPrompt: "Quickly explore and report findings. Be concise.",
-    Tools:        []agentcore.Tool{tools.NewRead(), tools.NewBash(".")},
+    Tools:        []agentcore.Tool{tools.NewRead("."), tools.NewBash(".")},
     MaxTurns:     5,
 }
 
 worker := agentcore.SubAgentConfig{
     Name:         "worker",
     Description:  "General-purpose executor",
-    Model:        llm.NewOpenAIModel("gpt-4.1-mini", apiKey),
+    Model:        model,
     SystemPrompt: "Implement tasks given to you.",
-    Tools:        []agentcore.Tool{tools.NewRead(), tools.NewWrite(), tools.NewEdit(), tools.NewBash(".")},
+    Tools:        []agentcore.Tool{tools.NewRead("."), tools.NewWrite("."), tools.NewEdit("."), tools.NewBash(".")},
 }
 
 agent := agentcore.NewAgent(
@@ -120,10 +125,10 @@ Three execution modes via tool call:
 
 ```go
 // Interrupt mid-run (delivered after current tool, remaining tools skipped)
-agent.Steer(agentcore.Message{Role: agentcore.RoleUser, Content: "Stop and focus on tests instead."})
+agent.Steer(agentcore.UserMsg("Stop and focus on tests instead."))
 
 // Queue for after the agent finishes
-agent.FollowUp(agentcore.Message{Role: agentcore.RoleUser, Content: "Now run the tests."})
+agent.FollowUp(agentcore.UserMsg("Now run the tests."))
 
 // Cancel immediately
 agent.Abort()

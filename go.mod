@@ -6,3 +6,5 @@ require (
 	github.com/voocel/litellm v1.5.8
 	golang.org/x/image v0.36.0
 )
+
+replace github.com/voocel/litellm => ../litellm

@@ -2,6 +2,7 @@ package tools
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -109,6 +110,8 @@ func (t *GrepTool) grepWithRg(ctx context.Context, a grepArgs, searchPath string
 	cmdArgs = append(cmdArgs, a.Pattern, searchPath)
 
 	cmd := exec.CommandContext(ctx, rgPath, cmdArgs...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, fmt.Errorf("pipe: %w", err)
@@ -161,9 +164,13 @@ func (t *GrepTool) grepWithRg(ctx context.Context, a grepArgs, searchPath string
 	if hitLimit && cmd.Process != nil {
 		cmd.Process.Kill()
 	}
-	cmd.Wait() //nolint: errcheck // exit errors expected after kill
+	cmd.Wait() //nolint: errcheck // exit code 1 (no matches) is normal, not an error
 
 	if len(lines) == 0 {
+		// rg exit code 2 (real error) writes to stderr; exit code 1 (no matches) does not.
+		if errMsg := strings.TrimSpace(stderr.String()); errMsg != "" {
+			return nil, fmt.Errorf("grep: %s", errMsg)
+		}
 		return json.Marshal("No matches found.")
 	}
 
@@ -199,6 +206,10 @@ func (t *GrepTool) grepWithGo(ctx context.Context, a grepArgs, searchPath string
 
 	err = filepath.WalkDir(searchPath, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
+			// If root path itself is invalid/inaccessible, return explicit error.
+			if path == searchPath {
+				return err
+			}
 			return filepath.SkipDir
 		}
 		if ctx.Err() != nil {

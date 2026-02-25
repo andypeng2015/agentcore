@@ -349,8 +349,20 @@ func (a *Agent) HasQueuedMessages() bool {
 	return len(a.steeringQ) > 0 || len(a.followUpQ) > 0
 }
 
-// Reset clears all state and queues.
+// Reset clears all state and queues. If the agent is running, it cancels and waits first.
 func (a *Agent) Reset() {
+	a.mu.Lock()
+	cancel := a.cancel
+	done := a.done
+	a.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		<-done
+	}
+
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.messages = nil
@@ -361,6 +373,8 @@ func (a *Agent) Reset() {
 	a.streamMessage = nil
 	a.pendingToolCalls = make(map[string]struct{})
 	a.totalUsage = Usage{}
+	a.done = nil
+	a.cancel = nil
 }
 
 // buildConfig constructs a LoopConfig from the agent's settings. Must be called with lock held.
@@ -396,6 +410,11 @@ func (a *Agent) buildConfig() LoopConfig {
 // consumeLoop reads events from the loop channel and updates internal state.
 // handles partial message residue, and constructs error fallback messages.
 func (a *Agent) consumeLoop(events <-chan Event) {
+	// Capture our done channel before any new Prompt() can replace a.done.
+	a.mu.Lock()
+	myDone := a.done
+	a.mu.Unlock()
+
 	var partial AgentMessage // tracks partial message during streaming
 
 	defer func() {
@@ -416,11 +435,8 @@ func (a *Agent) consumeLoop(events <-chan Event) {
 		a.streamMessage = nil
 		a.pendingToolCalls = make(map[string]struct{})
 		a.cancel = nil
-		done := a.done
 		a.mu.Unlock()
-		if done != nil {
-			close(done)
-		}
+		close(myDone)
 	}()
 
 	for ev := range events {

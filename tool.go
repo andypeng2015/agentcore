@@ -76,6 +76,13 @@ type ContentTool interface {
 	ExecuteContent(ctx context.Context, args json.RawMessage) ([]ContentBlock, error)
 }
 
+// Previewer is an optional interface for tools that can compute a preview
+// (e.g., diff) before execution. The agent loop calls Preview and emits the
+// result as EventToolExecUpdate so the UI can display it before the tool runs.
+type Previewer interface {
+	Preview(ctx context.Context, args json.RawMessage) (json.RawMessage, error)
+}
+
 // PermissionFunc is called before each tool execution.
 // Return nil to allow execution, or a non-nil error to deny.
 // The error message is sent back to the LLM as a tool error result.

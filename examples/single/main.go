@@ -43,6 +43,15 @@ func main() {
 			}
 		case agentcore.EventToolExecStart:
 			fmt.Printf("  [tool] %s(%s)\n", ev.Tool, string(ev.Args))
+		case agentcore.EventToolExecUpdate:
+			switch ev.UpdateKind {
+			case agentcore.ToolExecUpdatePreview:
+				fmt.Printf("  [preview] %s\n", string(ev.Result))
+			case agentcore.ToolExecUpdateProgress:
+				fmt.Printf("  [progress] %s\n", string(ev.Result))
+			default:
+				fmt.Printf("  [update] %s\n", string(ev.Result))
+			}
 		case agentcore.EventToolExecEnd:
 			if ev.IsError {
 				fmt.Printf("  [tool] %s error\n", ev.Tool)

@@ -85,6 +85,30 @@ func echoTool(calls *[]string) Tool {
 	})
 }
 
+type previewProgressTool struct {
+	previewCalls *int64
+}
+
+func (t *previewProgressTool) Name() string        { return "preview_tool" }
+func (t *previewProgressTool) Description() string { return "tool with preview and progress updates" }
+func (t *previewProgressTool) Schema() map[string]any {
+	return map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"x": map[string]any{"type": "string"},
+		},
+		"required": []string{"x"},
+	}
+}
+func (t *previewProgressTool) Preview(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
+	atomic.AddInt64(t.previewCalls, 1)
+	return json.RawMessage(`"preview"`), nil
+}
+func (t *previewProgressTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
+	ReportToolProgress(ctx, json.RawMessage(`"progress"`))
+	return json.RawMessage(`"ok"`), nil
+}
+
 func assistantMsg(text string, stop StopReason) Message {
 	return Message{
 		Role:       RoleAssistant,
@@ -304,6 +328,67 @@ func TestAgentLoop_PermissionDenied(t *testing.T) {
 	ev, ok := findEvent(events, EventToolExecEnd)
 	if !ok || !ev.IsError {
 		t.Fatal("expected tool_exec_end with isError=true")
+	}
+}
+
+func TestAgentLoop_PreviewNotCalledWhenArgsInvalid(t *testing.T) {
+	var previewCalls int64
+	pt := &previewProgressTool{previewCalls: &previewCalls}
+	tc := ToolCall{ID: "tc-preview-invalid", Name: "preview_tool", Args: json.RawMessage(`{}`)}
+
+	events := runTestLoop(t,
+		[]AgentMessage{UserMsg("test")},
+		AgentContext{Tools: []Tool{pt}},
+		LoopConfig{StreamFn: mockStreamFn(toolCallMsg(tc), assistantMsg("done", StopReasonStop))},
+	)
+
+	if got := atomic.LoadInt64(&previewCalls); got != 0 {
+		t.Fatalf("preview should not be called for invalid args, got %d", got)
+	}
+	if n := countEvent(events, EventToolExecUpdate); n != 0 {
+		t.Fatalf("expected no tool_exec_update for invalid args, got %d", n)
+	}
+
+	ev, ok := findEvent(events, EventToolExecEnd)
+	if !ok || !ev.IsError {
+		t.Fatal("expected tool_exec_end with isError=true")
+	}
+}
+
+func TestAgentLoop_ToolExecUpdateKinds(t *testing.T) {
+	var previewCalls int64
+	pt := &previewProgressTool{previewCalls: &previewCalls}
+	tc := ToolCall{ID: "tc-preview-valid", Name: "preview_tool", Args: json.RawMessage(`{"x":"v"}`)}
+
+	events := runTestLoop(t,
+		[]AgentMessage{UserMsg("test")},
+		AgentContext{Tools: []Tool{pt}},
+		LoopConfig{StreamFn: mockStreamFn(toolCallMsg(tc), assistantMsg("done", StopReasonStop))},
+	)
+
+	if got := atomic.LoadInt64(&previewCalls); got != 1 {
+		t.Fatalf("preview should be called once, got %d", got)
+	}
+
+	var updates []Event
+	for _, ev := range events {
+		if ev.Type == EventToolExecUpdate {
+			updates = append(updates, ev)
+		}
+	}
+	if len(updates) != 2 {
+		t.Fatalf("expected 2 tool_exec_update events (preview + progress), got %d", len(updates))
+	}
+	if updates[0].UpdateKind != ToolExecUpdatePreview {
+		t.Fatalf("first update should be preview, got %q", updates[0].UpdateKind)
+	}
+	if updates[1].UpdateKind != ToolExecUpdateProgress {
+		t.Fatalf("second update should be progress, got %q", updates[1].UpdateKind)
+	}
+
+	end, ok := findEvent(events, EventToolExecEnd)
+	if !ok || end.IsError {
+		t.Fatal("expected successful tool_exec_end")
 	}
 }
 

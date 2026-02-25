@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"unicode"
 
 	"github.com/voocel/agentcore/schema"
 )
@@ -37,7 +38,17 @@ type editArgs struct {
 	NewText string `json:"new_text"`
 }
 
-func (t *EditTool) Execute(_ context.Context, args json.RawMessage) (json.RawMessage, error) {
+// editResult holds the parsed and computed edit state, shared by Preview and Execute.
+type editResult struct {
+	path       string
+	bom        string
+	ending     string // original line ending
+	oldContent string // normalized-to-LF content before edit
+	newContent string
+}
+
+// parseAndMatch reads the file, finds the match, and computes the replacement.
+func (t *EditTool) parseAndMatch(args json.RawMessage) (*editResult, error) {
 	var a editArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return nil, fmt.Errorf("invalid args: %w", err)
@@ -51,50 +62,73 @@ func (t *EditTool) Execute(_ context.Context, args json.RawMessage) (json.RawMes
 	}
 
 	raw := string(data)
+	bom, raw := stripBOM(raw)
 
-	// Strip BOM (LLM won't include invisible BOM in oldText)
-	bom := ""
-	if strings.HasPrefix(raw, "\uFEFF") {
-		bom = "\uFEFF"
-		raw = raw[len("\uFEFF"):]
-	}
-
-	// Detect and normalize line endings
 	originalEnding := detectLineEnding(raw)
 	content := normalizeToLF(raw)
 	oldText := normalizeToLF(a.OldText)
 	newText := normalizeToLF(a.NewText)
 
-	// Try exact match first, then fuzzy match
-	matchIdx, matchLen, baseContent := fuzzyFind(content, oldText)
-	if matchIdx < 0 {
+	idx, matchLen := fuzzyFind(content, oldText)
+	if idx < 0 {
 		return nil, fmt.Errorf("could not find the exact text in %s. The old text must match exactly including all whitespace and newlines", a.Path)
 	}
 
-	// Check uniqueness using fuzzy-normalized content
-	fuzzyContent := normalizeForFuzzy(content)
-	fuzzyOld := normalizeForFuzzy(oldText)
-	if count := strings.Count(fuzzyContent, fuzzyOld); count > 1 {
+	if count := strings.Count(normalizeForFuzzy(content), normalizeForFuzzy(oldText)); count > 1 {
 		return nil, fmt.Errorf("found %d occurrences of the text in %s. The text must be unique. Provide more context", count, a.Path)
 	}
 
-	// Perform replacement
-	newContent := baseContent[:matchIdx] + newText + baseContent[matchIdx+matchLen:]
-	if baseContent == newContent {
+	newContent := content[:idx] + newText + content[idx+matchLen:]
+	if content == newContent {
 		return nil, fmt.Errorf("no changes made to %s. The replacement produced identical content", a.Path)
 	}
 
-	// Restore original line endings and BOM
-	finalContent := bom + restoreLineEndings(newContent, originalEnding)
-	if err := os.WriteFile(a.Path, []byte(finalContent), 0o644); err != nil {
-		return nil, fmt.Errorf("write %s: %w", a.Path, err)
+	return &editResult{
+		path:       a.Path,
+		bom:        bom,
+		ending:     originalEnding,
+		oldContent: content,
+		newContent: newContent,
+	}, nil
+}
+
+// Preview computes the diff without writing the file.
+func (t *EditTool) Preview(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	r, err := t.parseAndMatch(args)
+	if err != nil {
+		return nil, err
+	}
+	diff, firstLine := generateDiff(r.oldContent, r.newContent)
+	return json.Marshal(map[string]any{
+		"diff":               diff,
+		"first_changed_line": firstLine,
+	})
+}
+
+func (t *EditTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	r, err := t.parseAndMatch(args)
+	if err != nil {
+		return nil, err
 	}
 
-	// Generate unified diff
-	diff, firstLine := generateDiff(baseContent, newContent)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
+	finalContent := r.bom + restoreLineEndings(r.newContent, r.ending)
+	if err := os.WriteFile(r.path, []byte(finalContent), 0o644); err != nil {
+		return nil, fmt.Errorf("write %s: %w", r.path, err)
+	}
+
+	diff, firstLine := generateDiff(r.oldContent, r.newContent)
 	return json.Marshal(map[string]any{
-		"message":            fmt.Sprintf("Successfully replaced text in %s.", a.Path),
+		"message":            fmt.Sprintf("Successfully replaced text in %s.", r.path),
 		"diff":               diff,
 		"first_changed_line": firstLine,
 	})
@@ -127,56 +161,124 @@ func restoreLineEndings(text, ending string) string {
 	return text
 }
 
+// --- BOM ---
+
+func stripBOM(s string) (bom, text string) {
+	if strings.HasPrefix(s, "\uFEFF") {
+		return "\uFEFF", s[len("\uFEFF"):]
+	}
+	return "", s
+}
+
 // --- Fuzzy matching ---
 
-// normalizeForFuzzy strips trailing whitespace per line, normalizes smart quotes,
-// Unicode dashes, and special spaces to ASCII equivalents.
+// normalizeRuneForFuzzy normalizes one rune for fuzzy matching.
+func normalizeRuneForFuzzy(r rune) rune {
+	switch r {
+	case '\u2018', '\u2019', '\u201A', '\u201B':
+		return '\''
+	case '\u201C', '\u201D', '\u201E', '\u201F':
+		return '"'
+	case '\u2010', '\u2011', '\u2012', '\u2013', '\u2014', '\u2015', '\u2212':
+		return '-'
+	}
+	for _, s := range unicodeSpaces {
+		if r == s {
+			return ' '
+		}
+	}
+	return r
+}
+
+// normalizeForFuzzy strips trailing whitespace per line and normalizes
+// smart quotes, dashes, Unicode spaces to ASCII equivalents.
 func normalizeForFuzzy(text string) string {
 	lines := strings.Split(text, "\n")
 	for i, line := range lines {
-		lines[i] = strings.TrimRight(line, " \t")
+		line = strings.TrimRightFunc(line, unicode.IsSpace)
+		lines[i] = strings.Map(normalizeRuneForFuzzy, line)
 	}
-	text = strings.Join(lines, "\n")
+	return strings.Join(lines, "\n")
+}
 
-	// Smart quotes → ASCII
-	for _, r := range []rune{'\u2018', '\u2019', '\u201A', '\u201B'} {
-		text = strings.ReplaceAll(text, string(r), "'")
-	}
-	for _, r := range []rune{'\u201C', '\u201D', '\u201E', '\u201F'} {
-		text = strings.ReplaceAll(text, string(r), "\"")
+type fuzzyNormalized struct {
+	runes      []rune
+	runeToByte []int
+}
+
+func normalizeForFuzzyWithMap(text string) fuzzyNormalized {
+	lines := strings.Split(text, "\n")
+	outRunes := make([]rune, 0, len(text))
+	runeToByte := make([]int, 0, len(text)+1)
+
+	globalByte := 0
+	for li, line := range lines {
+		trimmed := strings.TrimRightFunc(line, unicode.IsSpace)
+		for relByte, r := range trimmed {
+			outRunes = append(outRunes, normalizeRuneForFuzzy(r))
+			runeToByte = append(runeToByte, globalByte+relByte)
+		}
+		if li < len(lines)-1 {
+			outRunes = append(outRunes, '\n')
+			runeToByte = append(runeToByte, globalByte+len(line))
+		}
+		globalByte += len(line)
+		if li < len(lines)-1 {
+			globalByte++
+		}
 	}
 
-	// Unicode dashes → ASCII hyphen
-	for _, r := range []rune{'\u2010', '\u2011', '\u2012', '\u2013', '\u2014', '\u2015', '\u2212'} {
-		text = strings.ReplaceAll(text, string(r), "-")
+	runeToByte = append(runeToByte, len(text))
+	return fuzzyNormalized{
+		runes:      outRunes,
+		runeToByte: runeToByte,
 	}
+}
 
-	// Special spaces → regular space (reuse shared unicodeSpaces from path.go)
-	for _, r := range unicodeSpaces {
-		text = strings.ReplaceAll(text, string(r), " ")
+func indexRuneSlice(haystack, needle []rune) int {
+	if len(needle) == 0 {
+		return 0
 	}
-
-	return text
+	if len(needle) > len(haystack) {
+		return -1
+	}
+outer:
+	for i := 0; i+len(needle) <= len(haystack); i++ {
+		for j := 0; j < len(needle); j++ {
+			if haystack[i+j] != needle[j] {
+				continue outer
+			}
+		}
+		return i
+	}
+	return -1
 }
 
 // fuzzyFind tries exact match first, then fuzzy match.
-// Returns match index, match length, and the base content to use for replacement.
-func fuzzyFind(content, oldText string) (index, matchLen int, baseContent string) {
-	// Try exact match
-	idx := strings.Index(content, oldText)
-	if idx >= 0 {
-		return idx, len(oldText), content
+// Fuzzy matching is only used for locating the replacement range.
+// The returned index/length always point to the original content bytes.
+func fuzzyFind(content, oldText string) (idx, matchLen int) {
+	if i := strings.Index(content, oldText); i >= 0 {
+		return i, len(oldText)
 	}
 
-	// Try fuzzy match
-	fuzzyContent := normalizeForFuzzy(content)
+	normContent := normalizeForFuzzyWithMap(content)
 	fuzzyOld := normalizeForFuzzy(oldText)
-	idx = strings.Index(fuzzyContent, fuzzyOld)
-	if idx >= 0 {
-		return idx, len(fuzzyOld), fuzzyContent
+	oldRunes := []rune(fuzzyOld)
+	runeIdx := indexRuneSlice(normContent.runes, oldRunes)
+	if runeIdx < 0 {
+		return -1, 0
 	}
 
-	return -1, 0, content
+	if runeIdx+len(oldRunes) > len(normContent.runeToByte)-1 {
+		return -1, 0
+	}
+	startByte := normContent.runeToByte[runeIdx]
+	endByte := normContent.runeToByte[runeIdx+len(oldRunes)]
+	if startByte < 0 || endByte < startByte || endByte > len(content) {
+		return -1, 0
+	}
+	return startByte, endByte - startByte
 }
 
 // --- Diff generation ---
