@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -58,10 +59,11 @@ type Agent struct {
 	followUpQ []AgentMessage
 
 	// Lifecycle
-	listeners []func(Event)
-	cancel    context.CancelFunc
-	done      chan struct{} // closed when loop finishes
-	mu        sync.Mutex
+	listeners       []func(Event)
+	cancel          context.CancelFunc
+	done            chan struct{} // closed when loop finishes
+	wantAbortMarker atomic.Bool  // set by Abort(), read by runLoop
+	mu              sync.Mutex
 }
 
 // NewAgent creates a new Agent with the given options.
@@ -186,8 +188,21 @@ func (a *Agent) FollowUp(msg AgentMessage) {
 	a.followUpQ = append(a.followUpQ, msg)
 }
 
-// Abort cancels the current execution.
+// Abort cancels the current execution and emits an abort marker message
+// so the LLM knows the user interrupted.
 func (a *Agent) Abort() {
+	a.wantAbortMarker.Store(true)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.cancel != nil {
+		a.cancel()
+	}
+}
+
+// AbortSilent cancels the current execution without emitting an abort marker.
+// Use for programmatic cancellation (e.g. plan mode transitions) where the
+// cancellation is not a user interruption.
+func (a *Agent) AbortSilent() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.cancel != nil {
@@ -402,8 +417,9 @@ func (a *Agent) buildConfig() LoopConfig {
 			defer a.mu.Unlock()
 			return dequeue(&a.followUpQ, a.followUpMode)
 		},
-		MaxRetryDelay: a.maxRetryDelay,
-		Middlewares:    a.middlewares,
+		MaxRetryDelay:         a.maxRetryDelay,
+		Middlewares:            a.middlewares,
+		ShouldEmitAbortMarker: a.wantAbortMarker.Load,
 	}
 }
 
@@ -435,6 +451,7 @@ func (a *Agent) consumeLoop(events <-chan Event) {
 		a.streamMessage = nil
 		a.pendingToolCalls = make(map[string]struct{})
 		a.cancel = nil
+		a.wantAbortMarker.Store(false)
 		a.mu.Unlock()
 		close(myDone)
 	}()

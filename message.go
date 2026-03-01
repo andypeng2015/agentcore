@@ -305,3 +305,15 @@ func ToolResultMsg(toolCallID string, content json.RawMessage, isError bool) Mes
 		Timestamp: time.Now(),
 	}
 }
+
+// AbortMsg creates an assistant abort marker message.
+// phase is "inference" or "tool_execution".
+func AbortMsg(text, phase string) Message {
+	return Message{
+		Role:       RoleAssistant,
+		Content:    []ContentBlock{TextBlock(text)},
+		StopReason: StopReasonAborted,
+		Metadata:   map[string]any{"abort_phase": phase},
+		Timestamp:  time.Now(),
+	}
+}

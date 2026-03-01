@@ -98,11 +98,23 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 	for {
 		hasMoreToolCalls := true
 		var steeringAfterTools []AgentMessage
+		afterToolExec := false
 
 		// Inner loop: process tool calls and steering messages
 		for hasMoreToolCalls || len(pendingMessages) > 0 {
 			// Check for context cancellation (Abort)
 			if ctx.Err() != nil {
+				if config.ShouldEmitAbortMarker != nil && config.ShouldEmitAbortMarker() {
+					phase := "inference"
+					text := "[Request interrupted by user]"
+					if afterToolExec {
+						phase = "tool_execution"
+						text = "[Request interrupted by user for tool use]"
+					}
+					abortMsg := AbortMsg(text, phase)
+					emit(ch, Event{Type: EventMessageEnd, Message: abortMsg})
+					*newMessages = append(*newMessages, abortMsg)
+				}
 				emit(ch, Event{Type: EventError, Err: ctx.Err()})
 				emit(ch, Event{Type: EventAgentEnd, NewMessages: *newMessages})
 				return
@@ -134,6 +146,16 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 			// Call LLM with retry (streaming: events emitted inside callLLM)
 			assistantMsg, err := callLLMWithRetry(ctx, currentCtx, config, ch)
 			if err != nil {
+				if ctx.Err() != nil {
+					if config.ShouldEmitAbortMarker != nil && config.ShouldEmitAbortMarker() {
+						abortMsg := AbortMsg("[Request interrupted by user]", "inference")
+						emit(ch, Event{Type: EventMessageEnd, Message: abortMsg})
+						*newMessages = append(*newMessages, abortMsg)
+					}
+					emit(ch, Event{Type: EventError, Err: ctx.Err()})
+					emit(ch, Event{Type: EventAgentEnd, NewMessages: *newMessages})
+					return
+				}
 				emitError(ch, fmt.Errorf("llm call failed: %w", err))
 				return
 			}
@@ -165,6 +187,7 @@ func runLoop(ctx context.Context, currentCtx *AgentContext, newMessages *[]Agent
 			if hasMoreToolCalls {
 				var steering []AgentMessage
 				turnToolResults, steering = executeToolCalls(ctx, currentCtx.Tools, toolCalls, config, toolErrors, ch)
+				afterToolExec = true
 
 				for _, tr := range turnToolResults {
 					resultMsg := toolResultToMessage(tr)

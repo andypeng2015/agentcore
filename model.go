@@ -82,6 +82,11 @@ type LoopConfig struct {
 	// Middlewares are applied around each tool execution (outermost first).
 	// Use for logging, timing, argument/result modification, etc.
 	Middlewares []ToolMiddleware
+
+	// ShouldEmitAbortMarker reports whether an abort marker message should be
+	// emitted when the context is cancelled. When nil or returns false, the
+	// cancellation is silent (legacy behavior). Set by Agent.Abort().
+	ShouldEmitAbortMarker func() bool
 }
 
 // ---------------------------------------------------------------------------
