@@ -45,6 +45,7 @@ type Agent struct {
 	sessionID         string
 	middlewares       []ToolMiddleware
 	maxRetryDelay    time.Duration
+	maxToolConcurrency int
 
 	// State
 	messages         []AgentMessage
@@ -419,6 +420,7 @@ func (a *Agent) buildConfig() LoopConfig {
 		},
 		MaxRetryDelay:         a.maxRetryDelay,
 		Middlewares:            a.middlewares,
+		MaxToolConcurrency:    a.maxToolConcurrency,
 		ShouldEmitAbortMarker: a.wantAbortMarker.Load,
 	}
 }

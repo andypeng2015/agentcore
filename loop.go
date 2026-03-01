@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/voocel/litellm"
@@ -471,172 +472,30 @@ func callLLMStream(ctx context.Context, model ChatModel, messages []Message, too
 	return partial, nil
 }
 
-// executeToolCalls runs tool calls sequentially, checking steering after each.
+// executeToolCalls runs tool calls, choosing sequential or parallel based on config.
 // toolErrors tracks consecutive failures per tool for circuit breaking.
 func executeToolCalls(ctx context.Context, tools []Tool, calls []ToolCall, config LoopConfig, toolErrors map[string]int, ch chan<- Event) ([]ToolResult, []AgentMessage) {
+	if config.MaxToolConcurrency > 1 && len(calls) > 1 {
+		return executeToolCallsParallel(ctx, tools, calls, config, toolErrors, config.MaxToolConcurrency, ch)
+	}
+	return executeToolCallsSequential(ctx, tools, calls, config, toolErrors, ch)
+}
+
+// executeToolCallsSequential runs tool calls one by one, checking steering after each.
+func executeToolCallsSequential(ctx context.Context, tools []Tool, calls []ToolCall, config LoopConfig, toolErrors map[string]int, ch chan<- Event) ([]ToolResult, []AgentMessage) {
 	results := make([]ToolResult, 0, len(calls))
 
 	for i, call := range calls {
-		tool := findTool(tools, call.Name)
-		label := toolLabel(tool)
+		failCount := toolErrors[call.Name]
+		result := executeSingleToolCall(ctx, tools, call, config, failCount, ch)
 
-		// Circuit breaker: skip if tool has exceeded consecutive failure threshold
-		if config.MaxToolErrors > 0 && toolErrors[call.Name] >= config.MaxToolErrors {
-			emit(ch, Event{
-				Type:      EventToolExecStart,
-				ToolID:    call.ID,
-				Tool:      call.Name,
-				ToolLabel: label,
-				Args:      call.Args,
-			})
-			errContent, _ := json.Marshal(fmt.Sprintf("tool %q disabled after %d consecutive errors", call.Name, config.MaxToolErrors))
-			result := ToolResult{ToolCallID: call.ID, Content: errContent, IsError: true}
-			emit(ch, Event{
-				Type:    EventToolExecEnd,
-				ToolID:  call.ID,
-				Tool:    call.Name,
-				Result:  result.Content,
-				IsError: true,
-			})
-			results = append(results, result)
-			continue
-		}
-
-		emit(ch, Event{
-			Type:      EventToolExecStart,
-			ToolID:    call.ID,
-			Tool:      call.Name,
-			ToolLabel: label,
-			Args:      call.Args,
-		})
-
-		// Permission check: deny before execution if callback returns error.
-		// Denial does NOT count toward toolErrors (policy decision, not tool failure).
-		if config.CheckPermission != nil {
-			if err := config.CheckPermission(ctx, call); err != nil {
-				errContent, _ := json.Marshal(err.Error())
-				result := ToolResult{ToolCallID: call.ID, Content: errContent, IsError: true}
-				emit(ch, Event{
-					Type:      EventToolExecEnd,
-					ToolID:    call.ID,
-					Tool:      call.Name,
-					ToolLabel: label,
-					Result:    result.Content,
-					IsError:   true,
-				})
-				results = append(results, result)
-				continue
-			}
-		}
-
-		var result ToolResult
-
-		if tool == nil {
-			errContent, _ := json.Marshal(fmt.Sprintf("tool %q not found", call.Name))
-			result = ToolResult{
-				ToolCallID: call.ID,
-				Content:    errContent,
-				IsError:    true,
-			}
-		} else if err := validateToolArgs(tool, call.Args); err != nil {
-			// Argument validation failed — return error to LLM without counting as tool error.
-			errContent, _ := json.Marshal(err.Error())
-			result = ToolResult{
-				ToolCallID: call.ID,
-				Content:    errContent,
-				IsError:    true,
-			}
-		} else {
-			// Preview: if tool supports it, compute and emit preview before execution.
-			// Preview runs only after args are validated.
-			if p, ok := tool.(Previewer); ok {
-				if preview, err := p.Preview(ctx, call.Args); err == nil {
-					emit(ch, Event{
-						Type:       EventToolExecUpdate,
-						ToolID:     call.ID,
-						Tool:       call.Name,
-						ToolLabel:  label,
-						Args:       call.Args,
-						Result:     preview,
-						UpdateKind: ToolExecUpdatePreview,
-					})
-				}
-			}
-
-			// Inject progress callback so tools can report partial results
-			progressCtx := WithToolProgress(ctx, func(partial json.RawMessage) {
-				emit(ch, Event{
-					Type:       EventToolExecUpdate,
-					ToolID:     call.ID,
-					Tool:       call.Name,
-					ToolLabel:  label,
-					Args:       call.Args,
-					Result:     partial,
-					UpdateKind: ToolExecUpdateProgress,
-				})
-			})
-
-			// ContentTool: returns rich content blocks (e.g., images).
-			// Bypasses middleware chain because middleware signature
-			// (json.RawMessage, error) does not accommodate []ContentBlock.
-			if ct, ok := tool.(ContentTool); ok {
-				blocks, execErr := ct.ExecuteContent(progressCtx, call.Args)
-				if execErr != nil {
-					errContent, _ := json.Marshal(execErr.Error())
-					result = ToolResult{
-						ToolCallID: call.ID,
-						Content:    errContent,
-						IsError:    true,
-					}
-				} else {
-					// Extract text summary for Event.Result so consumers
-					// can inspect output without parsing ContentBlocks.
-					summary := contentBlocksTextSummary(blocks)
-					result = ToolResult{
-						ToolCallID:    call.ID,
-						Content:       summary,
-						ContentBlocks: blocks,
-					}
-				}
+		// Update consecutive error counter (skip circuit-breaker and permission denial results).
+		if result.ToolName != "" {
+			if result.IsError {
+				toolErrors[result.ToolName]++
 			} else {
-				var output json.RawMessage
-				var execErr error
-				if len(config.Middlewares) > 0 {
-					exec := buildMiddlewareChain(tool, call, config.Middlewares)
-					output, execErr = exec(progressCtx, call.Args)
-				} else {
-					output, execErr = tool.Execute(progressCtx, call.Args)
-				}
-				if execErr != nil {
-					errContent, _ := json.Marshal(execErr.Error())
-					result = ToolResult{
-						ToolCallID: call.ID,
-						Content:    errContent,
-						IsError:    true,
-					}
-				} else {
-					result = ToolResult{
-						ToolCallID: call.ID,
-						Content:    output,
-					}
-				}
+				delete(toolErrors, result.ToolName)
 			}
-		}
-
-		emit(ch, Event{
-			Type:      EventToolExecEnd,
-			ToolID:    call.ID,
-			Tool:      call.Name,
-			ToolLabel: label,
-			Result:    result.Content,
-			IsError:   result.IsError,
-		})
-
-		// Update consecutive error counter
-		if result.IsError {
-			toolErrors[call.Name]++
-		} else {
-			delete(toolErrors, call.Name)
 		}
 
 		results = append(results, result)
@@ -645,7 +504,6 @@ func executeToolCalls(ctx context.Context, tools []Tool, calls []ToolCall, confi
 		if config.GetSteeringMessages != nil {
 			steering := config.GetSteeringMessages()
 			if len(steering) > 0 {
-				// Skip remaining tool calls
 				for _, skipped := range calls[i+1:] {
 					results = append(results, skipToolCall(skipped, tools, ch))
 				}
@@ -655,6 +513,221 @@ func executeToolCalls(ctx context.Context, tools []Tool, calls []ToolCall, confi
 	}
 
 	return results, nil
+}
+
+// executeToolCallsParallel runs tool calls concurrently with a semaphore limit.
+// Steering is checked once after all tools complete (not between individual tools).
+func executeToolCallsParallel(ctx context.Context, tools []Tool, calls []ToolCall, config LoopConfig, toolErrors map[string]int, maxConc int, ch chan<- Event) ([]ToolResult, []AgentMessage) {
+	results := make([]ToolResult, len(calls))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, maxConc)
+
+	for i, call := range calls {
+		failCount := toolErrors[call.Name]
+		wg.Add(1)
+		go func(idx int, tc ToolCall, fc int) {
+			defer wg.Done()
+			// Use select so ctx cancellation unblocks goroutines waiting for a slot.
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				content, _ := json.Marshal("Tool execution cancelled.")
+				results[idx] = ToolResult{ToolCallID: tc.ID, Content: content, IsError: true}
+				return
+			}
+			results[idx] = executeSingleToolCall(ctx, tools, tc, config, fc, ch)
+		}(i, call, failCount)
+	}
+
+	wg.Wait()
+
+	// Update toolErrors sequentially (safe: all goroutines are done).
+	for _, r := range results {
+		if r.ToolName != "" {
+			if r.IsError {
+				toolErrors[r.ToolName]++
+			} else {
+				delete(toolErrors, r.ToolName)
+			}
+		}
+	}
+
+	// Single steering check after all tools complete.
+	var steering []AgentMessage
+	if config.GetSteeringMessages != nil {
+		steering = config.GetSteeringMessages()
+	}
+	if len(steering) == 0 {
+		steering = nil
+	}
+	return results, steering
+}
+
+// executeSingleToolCall executes one tool call: emit events, check permission, run tool.
+// result.ToolName is set when the caller should update toolErrors; empty means skip
+// (circuit-breaker hit, permission denial, or context cancellation).
+func executeSingleToolCall(ctx context.Context, tools []Tool, call ToolCall, config LoopConfig, failCount int, ch chan<- Event) ToolResult {
+	// Fast exit: context already cancelled — don't start any tool work.
+	if ctx.Err() != nil {
+		content, _ := json.Marshal("Tool execution cancelled.")
+		return ToolResult{ToolCallID: call.ID, Content: content, IsError: true}
+	}
+
+	tool := findTool(tools, call.Name)
+	label := toolLabel(tool)
+
+	// Circuit breaker: skip if tool has exceeded consecutive failure threshold
+	if config.MaxToolErrors > 0 && failCount >= config.MaxToolErrors {
+		emit(ch, Event{
+			Type:      EventToolExecStart,
+			ToolID:    call.ID,
+			Tool:      call.Name,
+			ToolLabel: label,
+			Args:      call.Args,
+		})
+		errContent, _ := json.Marshal(fmt.Sprintf("tool %q disabled after %d consecutive errors", call.Name, config.MaxToolErrors))
+		result := ToolResult{ToolCallID: call.ID, Content: errContent, IsError: true}
+		emit(ch, Event{
+			Type:    EventToolExecEnd,
+			ToolID:  call.ID,
+			Tool:    call.Name,
+			Result:  result.Content,
+			IsError: true,
+		})
+		return result // ToolName empty → don't count
+	}
+
+	emit(ch, Event{
+		Type:      EventToolExecStart,
+		ToolID:    call.ID,
+		Tool:      call.Name,
+		ToolLabel: label,
+		Args:      call.Args,
+	})
+
+	// Permission check: deny before execution if callback returns error.
+	// Denial does NOT count toward toolErrors (policy decision, not tool failure).
+	if config.CheckPermission != nil {
+		if err := config.CheckPermission(ctx, call); err != nil {
+			errContent, _ := json.Marshal(err.Error())
+			result := ToolResult{ToolCallID: call.ID, Content: errContent, IsError: true}
+			emit(ch, Event{
+				Type:      EventToolExecEnd,
+				ToolID:    call.ID,
+				Tool:      call.Name,
+				ToolLabel: label,
+				Result:    result.Content,
+				IsError:   true,
+			})
+			return result // ToolName empty → don't count
+		}
+	}
+
+	var result ToolResult
+
+	if tool == nil {
+		errContent, _ := json.Marshal(fmt.Sprintf("tool %q not found", call.Name))
+		result = ToolResult{
+			ToolCallID: call.ID,
+			Content:    errContent,
+			IsError:    true,
+		}
+	} else if err := validateToolArgs(tool, call.Args); err != nil {
+		// Argument validation failed — return error to LLM without counting as tool error.
+		errContent, _ := json.Marshal(err.Error())
+		result = ToolResult{
+			ToolCallID: call.ID,
+			Content:    errContent,
+			IsError:    true,
+		}
+	} else {
+		// Preview: if tool supports it, compute and emit preview before execution.
+		// Preview runs only after args are validated.
+		if p, ok := tool.(Previewer); ok {
+			if preview, err := p.Preview(ctx, call.Args); err == nil {
+				emit(ch, Event{
+					Type:       EventToolExecUpdate,
+					ToolID:     call.ID,
+					Tool:       call.Name,
+					ToolLabel:  label,
+					Args:       call.Args,
+					Result:     preview,
+					UpdateKind: ToolExecUpdatePreview,
+				})
+			}
+		}
+
+		// Inject progress callback so tools can report partial results
+		progressCtx := WithToolProgress(ctx, func(partial json.RawMessage) {
+			emit(ch, Event{
+				Type:       EventToolExecUpdate,
+				ToolID:     call.ID,
+				Tool:       call.Name,
+				ToolLabel:  label,
+				Args:       call.Args,
+				Result:     partial,
+				UpdateKind: ToolExecUpdateProgress,
+			})
+		})
+
+		// ContentTool: returns rich content blocks (e.g., images).
+		// Bypasses middleware chain because middleware signature
+		// (json.RawMessage, error) does not accommodate []ContentBlock.
+		if ct, ok := tool.(ContentTool); ok {
+			blocks, execErr := ct.ExecuteContent(progressCtx, call.Args)
+			if execErr != nil {
+				errContent, _ := json.Marshal(execErr.Error())
+				result = ToolResult{
+					ToolCallID: call.ID,
+					Content:    errContent,
+					IsError:    true,
+				}
+			} else {
+				summary := contentBlocksTextSummary(blocks)
+				result = ToolResult{
+					ToolCallID:    call.ID,
+					Content:       summary,
+					ContentBlocks: blocks,
+				}
+			}
+		} else {
+			var output json.RawMessage
+			var execErr error
+			if len(config.Middlewares) > 0 {
+				exec := buildMiddlewareChain(tool, call, config.Middlewares)
+				output, execErr = exec(progressCtx, call.Args)
+			} else {
+				output, execErr = tool.Execute(progressCtx, call.Args)
+			}
+			if execErr != nil {
+				errContent, _ := json.Marshal(execErr.Error())
+				result = ToolResult{
+					ToolCallID: call.ID,
+					Content:    errContent,
+					IsError:    true,
+				}
+			} else {
+				result = ToolResult{
+					ToolCallID: call.ID,
+					Content:    output,
+				}
+			}
+		}
+	}
+
+	emit(ch, Event{
+		Type:      EventToolExecEnd,
+		ToolID:    call.ID,
+		Tool:      call.Name,
+		ToolLabel: label,
+		Result:    result.Content,
+		IsError:   result.IsError,
+	})
+
+	// Mark for toolErrors tracking by caller.
+	result.ToolName = call.Name
+	return result
 }
 
 // skipToolCall creates a skipped result for an interrupted tool call.

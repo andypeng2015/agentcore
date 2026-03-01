@@ -124,6 +124,12 @@ func WithMiddlewares(mw ...ToolMiddleware) AgentOption {
 	return func(a *Agent) { a.middlewares = mw }
 }
 
+// WithMaxToolConcurrency sets the maximum number of tools executed in parallel.
+// 0 or 1 = sequential (default). >1 enables concurrent tool execution.
+func WithMaxToolConcurrency(n int) AgentOption {
+	return func(a *Agent) { a.maxToolConcurrency = n }
+}
+
 // WithContextPipeline sets both TransformContext and ConvertToLLM in one call.
 // This is the recommended way to configure context compaction:
 //

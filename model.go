@@ -83,6 +83,11 @@ type LoopConfig struct {
 	// Use for logging, timing, argument/result modification, etc.
 	Middlewares []ToolMiddleware
 
+	// MaxToolConcurrency limits parallel tool execution.
+	// 0 or 1 = sequential (default, backward compatible).
+	// >1 = up to N tools execute concurrently within a single turn.
+	MaxToolConcurrency int
+
 	// ShouldEmitAbortMarker reports whether an abort marker message should be
 	// emitted when the context is cancelled. When nil or returns false, the
 	// cancellation is silent (legacy behavior). Set by Agent.Abort().

@@ -43,6 +43,7 @@ type ToolCall struct {
 // ToolResult represents a tool execution outcome.
 type ToolResult struct {
 	ToolCallID    string           `json:"tool_call_id"`
+	ToolName      string           `json:"-"` // internal: for toolErrors tracking
 	Content       json.RawMessage  `json:"content,omitempty"`
 	ContentBlocks []ContentBlock   `json:"-"` // rich content (images); not serialized
 	IsError       bool             `json:"is_error,omitempty"`
