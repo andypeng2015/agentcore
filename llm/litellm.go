@@ -443,9 +443,12 @@ func applyToolConfig(request *litellm.Request, tools []agentcore.ToolSpec) {
 	request.Tools = ltTools
 }
 
-// safeArgs returns args as json.RawMessage, defaulting to "{}" if empty.
+// safeArgs returns args as json.RawMessage, defaulting to "{}" if empty or invalid JSON.
 func safeArgs(args string) json.RawMessage {
 	if args == "" {
+		return json.RawMessage("{}")
+	}
+	if !json.Valid([]byte(args)) {
 		return json.RawMessage("{}")
 	}
 	return json.RawMessage(args)
