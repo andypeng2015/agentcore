@@ -25,11 +25,11 @@ agentcore/memory/     Context compaction — auto-summarize long conversations
 
 Core design:
 
-- **Pure function loop** (`loop.go`) — double loop: inner processes tool calls + steering, outer handles follow-up
-- **Stateful Agent** (`agent.go`) — consumes loop events to update state, same as any external listener
+- **Standalone loop** (`loop.go`) — free function, all dependencies injected via parameters. Double loop: inner processes tool calls + steering, outer handles follow-up
+- **Stateful Agent** (`agent.go`) — sole consumer of loop events, updates internal state then dispatches to external listeners
 - **Event stream** — single `<-chan Event` output drives any UI (TUI, Web, Slack, logging)
 - **Two-stage pipeline** — `TransformContext` (prune/inject) → `ConvertToLLM` (filter to LLM messages)
-- **SubAgent tool** (`subagent.go`) — multi-agent via tool invocation, three modes: single, parallel, chain
+- **SubAgent tool** (`subagent.go`) — multi-agent via tool invocation, four modes: single, parallel, chain, background
 - **Context compaction** (`memory/`) — automatic summarization when context approaches window limit
 
 ## Quick Start
@@ -108,7 +108,7 @@ agent := agentcore.NewAgent(
 )
 ```
 
-Three execution modes via tool call:
+Four execution modes via tool call:
 
 ```jsonc
 // Single: one agent, one task
@@ -119,6 +119,9 @@ Three execution modes via tool call:
 
 // Chain: sequential with {previous} context passing
 {"chain": [{"agent": "scout", "task": "Find auth code"}, {"agent": "worker", "task": "Refactor based on: {previous}"}]}
+
+// Background: async execution, returns immediately, notifies on completion
+{"agent": "worker", "task": "Run full test suite", "background": true, "description": "Running tests"}
 ```
 
 ### Steering & Follow-Up
@@ -229,39 +232,17 @@ agent := agentcore.NewAgent(
 |--------|-------------|
 | `NewAgent(opts...)` | Create agent with options |
 | `Prompt(input)` | Start new conversation turn |
+| `PromptMessages(msgs...)` | Start turn with arbitrary AgentMessages |
 | `Continue()` | Resume from current context |
 | `Steer(msg)` | Inject steering message mid-run |
 | `FollowUp(msg)` | Queue message for after completion |
 | `Abort()` | Cancel current execution |
+| `AbortSilent()` | Cancel without emitting abort marker |
 | `WaitForIdle()` | Block until agent finishes |
 | `Subscribe(fn)` | Register event listener |
 | `State()` | Snapshot of current state |
-
-### Options
-
-| Option | Description |
-|--------|-------------|
-| `WithModel(m)` | Set LLM model |
-| `WithSystemPrompt(s)` | Set system prompt |
-| `WithTools(t...)` | Set tool list |
-| `WithMaxTurns(n)` | Safety limit (default: 10) |
-| `WithMaxRetries(n)` | LLM call retry limit (default: 3) |
-| `WithMaxRetryDelay(d)` | Cap on retry wait time (default: 60s) |
-| `WithMaxToolErrors(n)` | Circuit breaker threshold per tool (default: 3) |
-| `WithStreamFn(fn)` | Custom LLM call function |
-| `WithTransformContext(fn)` | Context transform (stage 1) |
-| `WithConvertToLLM(fn)` | Message conversion (stage 2) |
-| `WithContextPipeline(t,c)` | Set both stages in one call |
-| `WithThinkingLevel(l)` | Reasoning depth: `off` / `low` / `medium` / `high` |
-| `WithThinkingBudgets(m)` | Per-level thinking token budgets |
-| `WithSteeringMode(m)` | Queue drain mode: `all` or `one-at-a-time` |
-| `WithFollowUpMode(m)` | Queue drain mode: `all` or `one-at-a-time` |
-| `WithPermission(fn)` | Pre-execution permission check |
-| `WithMiddlewares(mw...)` | Tool execution middleware chain |
-| `WithContextWindow(n)` | Context window size for usage tracking |
-| `WithContextEstimate(fn)` | Token estimation function |
-| `WithGetApiKey(fn)` | Dynamic API key resolver |
-| `WithSessionID(id)` | Provider-level session caching |
+| `ExportMessages()` | Export messages for serialization |
+| `ImportMessages(msgs)` | Import deserialized messages |
 
 ## License
 

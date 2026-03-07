@@ -25,11 +25,11 @@ agentcore/memory/     上下文压缩 —— 自动摘要长对话
 
 核心设计：
 
-- **纯函数循环**（`loop.go`）—— 双层循环：内层处理工具调用 + steering 中断，外层处理 follow-up 续接
-- **有状态 Agent**（`agent.go`）—— 消费循环事件更新状态，与外部监听者地位相同
+- **独立函数循环**（`loop.go`）—— 无结构体依赖，所有输入通过参数注入。双层循环：内层处理工具调用 + steering 中断，外层处理 follow-up 续接
+- **有状态 Agent**（`agent.go`）—— 作为循环事件的唯一消费者，更新内部状态后分发给外部监听者
 - **事件流** —— 单一 `<-chan Event` 输出，驱动任何 UI（TUI、Web、Slack、日志）
 - **两阶段管道** —— `TransformContext`（裁剪/注入）→ `ConvertToLLM`（过滤为 LLM 消息）
-- **SubAgent 工具**（`subagent.go`）—— 通过工具调用实现多 Agent，三种模式：single、parallel、chain
+- **SubAgent 工具**（`subagent.go`）—— 通过工具调用实现多 Agent，四种模式：single、parallel、chain、background
 - **上下文压缩**（`memory/`）—— 接近上下文窗口上限时自动摘要压缩
 
 ## 快速开始
@@ -108,7 +108,7 @@ agent := agentcore.NewAgent(
 )
 ```
 
-LLM 通过工具调用触发三种执行模式：
+LLM 通过工具调用触发四种执行模式：
 
 ```jsonc
 // Single：单个 agent 执行单个任务
@@ -119,6 +119,9 @@ LLM 通过工具调用触发三种执行模式：
 
 // Chain：顺序执行，{previous} 传递上一步输出
 {"chain": [{"agent": "scout", "task": "查找认证代码"}, {"agent": "worker", "task": "基于以下内容重构: {previous}"}]}
+
+// Background：后台异步执行，立即返回，完成后通知
+{"agent": "worker", "task": "运行完整测试套件", "background": true, "description": "正在执行测试"}
 ```
 
 ### Steering 与 Follow-Up
@@ -229,39 +232,17 @@ agent := agentcore.NewAgent(
 |------|------|
 | `NewAgent(opts...)` | 创建 Agent |
 | `Prompt(input)` | 发起新对话轮次 |
+| `PromptMessages(msgs...)` | 用任意 AgentMessage 发起对话 |
 | `Continue()` | 从当前上下文继续 |
 | `Steer(msg)` | 中断注入 steering 消息 |
 | `FollowUp(msg)` | 排队 follow-up 消息 |
 | `Abort()` | 取消当前执行 |
+| `AbortSilent()` | 静默取消（不发 abort 标记） |
 | `WaitForIdle()` | 阻塞等待完成 |
 | `Subscribe(fn)` | 注册事件监听 |
 | `State()` | 获取当前状态快照 |
-
-### 构造选项
-
-| 选项 | 说明 |
-|------|------|
-| `WithModel(m)` | 设置 LLM 模型 |
-| `WithSystemPrompt(s)` | 设置系统提示词 |
-| `WithTools(t...)` | 设置工具列表 |
-| `WithMaxTurns(n)` | 安全上限（默认 10） |
-| `WithMaxRetries(n)` | LLM 调用重试次数（默认 3） |
-| `WithMaxRetryDelay(d)` | 重试等待上限（默认 60s） |
-| `WithMaxToolErrors(n)` | 工具熔断阈值（默认 3） |
-| `WithStreamFn(fn)` | 自定义 LLM 调用函数 |
-| `WithTransformContext(fn)` | 上下文变换（阶段 1） |
-| `WithConvertToLLM(fn)` | 消息转换（阶段 2） |
-| `WithContextPipeline(t,c)` | 一次设置两个阶段 |
-| `WithThinkingLevel(l)` | 推理深度：`off` / `low` / `medium` / `high` |
-| `WithThinkingBudgets(m)` | 按级别设置 thinking token 预算 |
-| `WithSteeringMode(m)` | 队列出队模式：`all` 或 `one-at-a-time` |
-| `WithFollowUpMode(m)` | 队列出队模式：`all` 或 `one-at-a-time` |
-| `WithPermission(fn)` | 工具执行前权限检查 |
-| `WithMiddlewares(mw...)` | 工具执行中间件链 |
-| `WithContextWindow(n)` | 上下文窗口大小（用于用量追踪） |
-| `WithContextEstimate(fn)` | Token 估算函数 |
-| `WithGetApiKey(fn)` | 动态 API Key 解析器 |
-| `WithSessionID(id)` | 提供商级会话缓存 |
+| `ExportMessages()` | 导出消息用于序列化 |
+| `ImportMessages(msgs)` | 导入反序列化的消息 |
 
 ## 许可证
 
