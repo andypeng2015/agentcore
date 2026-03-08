@@ -13,6 +13,7 @@ import (
 )
 
 var defaultPathTools = []string{"read", "write", "edit", "ls", "find", "grep"}
+var defaultOptionalPathTools = []string{"ls", "find", "grep"}
 
 // Rule is a lightweight permission rule for a single tool call.
 type Rule func(ctx context.Context, call agentcore.ToolCall) error
@@ -66,6 +67,7 @@ func RestrictPaths(root string, names ...string) Rule {
 	if len(limitedTools) == 0 {
 		limitedTools = makeNameSet(defaultPathTools...)
 	}
+	optionalPathTools := makeNameSet(defaultOptionalPathTools...)
 
 	return func(_ context.Context, call agentcore.ToolCall) error {
 		if !limitedTools[call.Name] {
@@ -74,10 +76,14 @@ func RestrictPaths(root string, names ...string) Rule {
 
 		path, ok := extractPath(call.Args)
 		if !ok {
-			return nil
+			return fmt.Errorf("tool %q requires valid JSON args with a path field", call.Name)
 		}
 		if path == "" {
-			path = rootPath
+			if optionalPathTools[call.Name] {
+				path = rootPath
+			} else {
+				return fmt.Errorf("tool %q requires a non-empty path", call.Name)
+			}
 		}
 
 		resolved := tools.ResolvePath(rootPath, path)

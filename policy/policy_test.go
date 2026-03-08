@@ -56,6 +56,38 @@ func TestRestrictPaths(t *testing.T) {
 	}
 }
 
+func TestRestrictPaths_DeniesInvalidJSON(t *testing.T) {
+	root := t.TempDir()
+	rule := RestrictPaths(root)
+
+	if err := rule(context.Background(), toolCall("read", `{invalid`)); err == nil {
+		t.Fatal("invalid JSON should be denied")
+	}
+}
+
+func TestRestrictPaths_DeniesEmptyPathForRequiredPathTools(t *testing.T) {
+	root := t.TempDir()
+	rule := RestrictPaths(root)
+
+	if err := rule(context.Background(), toolCall("read", `{}`)); err == nil {
+		t.Fatal("read without path should be denied")
+	}
+	if err := rule(context.Background(), toolCall("edit", `{"old_text":"a","new_text":"b"}`)); err == nil {
+		t.Fatal("edit without path should be denied")
+	}
+}
+
+func TestRestrictPaths_AllowsEmptyPathForOptionalPathTools(t *testing.T) {
+	root := t.TempDir()
+	rule := RestrictPaths(root)
+
+	for _, name := range []string{"ls", "find", "grep"} {
+		if err := rule(context.Background(), toolCall(name, `{}`)); err != nil {
+			t.Fatalf("%s without path should be allowed: %v", name, err)
+		}
+	}
+}
+
 func TestRestrictPaths_DeniesSymlinkEscape(t *testing.T) {
 	root := t.TempDir()
 	outsideDir := t.TempDir()

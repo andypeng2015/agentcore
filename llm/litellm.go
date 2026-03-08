@@ -231,14 +231,15 @@ func (l *LiteLLMAdapter) GenerateStream(ctx context.Context, messages []agentcor
 			return
 		}
 
-		// Map usage from collected response
-		if resp != nil && resp.Usage.TotalTokens > 0 {
+		// Map usage from collected response.
+		if resp != nil && (resp.Usage.TotalTokens > 0 || resp.Usage.PromptTokens > 0) {
+			u := resp.Usage
 			partial.Usage = &agentcore.Usage{
-				Input:       resp.Usage.PromptTokens,
-				Output:      resp.Usage.CompletionTokens,
-				CacheRead:   resp.Usage.CacheReadInputTokens,
-				CacheWrite:  resp.Usage.CacheCreationInputTokens,
-				TotalTokens: resp.Usage.TotalTokens,
+				Input:       u.PromptTokens,
+				Output:      u.CompletionTokens,
+				CacheRead:   u.CacheReadInputTokens,
+				CacheWrite:  u.CacheCreationInputTokens,
+				TotalTokens: u.TotalTokens,
 			}
 			partial.Usage.Cost = CalculateCost(l.Info().Pricing, partial.Usage)
 		}

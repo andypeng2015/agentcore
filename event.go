@@ -88,6 +88,9 @@ func DefaultConvertToLLM(msgs []AgentMessage) []Message {
 	out := make([]Message, 0, len(msgs))
 	for _, m := range msgs {
 		if msg, ok := m.(Message); ok {
+			if msg.StopReason == StopReasonError || msg.StopReason == StopReasonAborted {
+				continue
+			}
 			out = append(out, msg)
 		}
 	}

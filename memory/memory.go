@@ -43,6 +43,9 @@ func CompactionConvertToLLM(msgs []agentcore.AgentMessage) []agentcore.Message {
 				Timestamp: v.Timestamp,
 			})
 		case agentcore.Message:
+			if v.StopReason == agentcore.StopReasonError || v.StopReason == agentcore.StopReasonAborted {
+				continue
+			}
 			out = append(out, v)
 		}
 	}

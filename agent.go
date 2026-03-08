@@ -517,6 +517,7 @@ func (a *Agent) consumeLoop(events <-chan Event) {
 
 		// Error — construct fallback assistant message (skip for intentional abort)
 		case EventError:
+			partial = nil // discard incomplete streaming message to prevent defer from appending it
 			if ev.Err != nil && !errors.Is(ev.Err, context.Canceled) {
 				a.lastError = ev.Err.Error()
 				errMsg := Message{

@@ -607,11 +607,10 @@ func executeSingleToolCall(ctx context.Context, tools []Tool, call ToolCall, con
 	})
 
 	// Permission check: deny before execution if callback returns error.
-	// Denial does NOT count toward toolErrors (policy decision, not tool failure).
 	if config.CheckPermission != nil {
 		if err := config.CheckPermission(ctx, call); err != nil {
 			errContent, _ := json.Marshal(err.Error())
-			result := ToolResult{ToolCallID: call.ID, Content: errContent, IsError: true}
+			result := ToolResult{ToolCallID: call.ID, ToolName: call.Name, Content: errContent, IsError: true}
 			emit(ch, Event{
 				Type:      EventToolExecEnd,
 				ToolID:    call.ID,
@@ -620,7 +619,7 @@ func executeSingleToolCall(ctx context.Context, tools []Tool, call ToolCall, con
 				Result:    result.Content,
 				IsError:   true,
 			})
-			return result // ToolName empty → don't count
+			return result
 		}
 	}
 
@@ -634,10 +633,10 @@ func executeSingleToolCall(ctx context.Context, tools []Tool, call ToolCall, con
 			IsError:    true,
 		}
 	} else if err := validateToolArgs(tool, call.Args); err != nil {
-		// Argument validation failed — return error to LLM without counting as tool error.
 		errContent, _ := json.Marshal(err.Error())
 		result = ToolResult{
 			ToolCallID: call.ID,
+			ToolName:   call.Name,
 			Content:    errContent,
 			IsError:    true,
 		}
