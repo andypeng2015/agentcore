@@ -425,6 +425,15 @@ func (t *SubAgentTool) runAgent(ctx context.Context, agentName, task string, mod
 				})
 				ReportToolProgress(ctx, data)
 			}
+			if ev.Message != nil {
+				if thinking := ev.Message.ThinkingContent(); thinking != "" {
+					data, _ := json.Marshal(map[string]any{
+						"agent":    agentName,
+						"thinking": thinking,
+					})
+					ReportToolProgress(ctx, data)
+				}
+			}
 		case EventToolExecEnd:
 			if ev.IsError {
 				data, _ := json.Marshal(map[string]any{

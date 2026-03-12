@@ -84,6 +84,15 @@ type Previewer interface {
 	Preview(ctx context.Context, args json.RawMessage) (json.RawMessage, error)
 }
 
+// DeferFilter controls which tools are visible to the LLM.
+// When a tool in the agent's tool list implements DeferFilter,
+// buildToolSpecs calls IsDeferred for each tool and skips those
+// that return true (their schemas are not sent to the LLM).
+// Tools remain registered for execution — only their specs are hidden.
+type DeferFilter interface {
+	IsDeferred(toolName string) bool
+}
+
 // PermissionFunc is called before each tool execution.
 // Return nil to allow execution, or a non-nil error to deny.
 // The error message is sent back to the LLM as a tool error result.

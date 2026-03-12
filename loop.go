@@ -801,17 +801,31 @@ func toolLabel(tool Tool) string {
 }
 
 // buildToolSpecs converts Tool interfaces to ToolSpec for the LLM.
+// When a DeferFilter is present among the tools, deferred tools are excluded.
 func buildToolSpecs(tools []Tool) []ToolSpec {
 	if len(tools) == 0 {
 		return nil
 	}
+
+	var filter DeferFilter
+	for _, t := range tools {
+		if f, ok := t.(DeferFilter); ok {
+			filter = f
+			break
+		}
+	}
+
 	specs := make([]ToolSpec, 0, len(tools))
 	for _, t := range tools {
-		specs = append(specs, ToolSpec{
+		spec := ToolSpec{
 			Name:        t.Name(),
 			Description: t.Description(),
 			Parameters:  t.Schema(),
-		})
+		}
+		if filter != nil && filter.IsDeferred(t.Name()) {
+			spec.DeferLoading = true
+		}
+		specs = append(specs, spec)
 	}
 	return specs
 }

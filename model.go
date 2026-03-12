@@ -33,9 +33,10 @@ type LLMResponse struct {
 
 // ToolSpec describes a tool for the LLM (name + description + JSON schema).
 type ToolSpec struct {
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Parameters  any    `json:"parameters"`
+	Name         string `json:"name"`
+	Description  string `json:"description"`
+	Parameters   any    `json:"parameters"`
+	DeferLoading bool   `json:"defer_loading,omitempty"`
 }
 
 // LoopConfig configures the agent loop.

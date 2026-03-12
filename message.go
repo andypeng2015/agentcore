@@ -32,6 +32,7 @@ const (
 	ContentThinking ContentType = "thinking"
 	ContentToolCall ContentType = "toolCall"
 	ContentImage    ContentType = "image"
+	ContentToolRef  ContentType = "tool_reference"
 )
 
 // ContentBlock is a tagged union for message content.
@@ -42,6 +43,7 @@ type ContentBlock struct {
 	Thinking string      `json:"thinking,omitempty"`
 	ToolCall *ToolCall   `json:"tool_call,omitempty"`
 	Image    *ImageData  `json:"image,omitempty"`
+	ToolName string      `json:"tool_name,omitempty"` // tool_reference: referenced tool name
 }
 
 // ImageData holds image content as base64 data or a URL.
@@ -74,6 +76,10 @@ func ImageBlock(data, mimeType string) ContentBlock {
 
 func ImageURLBlock(url string) ContentBlock {
 	return ContentBlock{Type: ContentImage, Image: &ImageData{URL: url}}
+}
+
+func ToolRefBlock(toolName string) ContentBlock {
+	return ContentBlock{Type: ContentToolRef, ToolName: toolName}
 }
 
 // ---------------------------------------------------------------------------

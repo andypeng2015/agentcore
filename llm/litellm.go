@@ -314,6 +314,11 @@ func convertSingleMessage(msg agentcore.Message) litellm.Message {
 		if isErr, ok := msg.Metadata["is_error"].(bool); ok {
 			llmMsg.IsError = isErr
 		}
+		// Convert tool_reference content blocks for tool search results.
+		if hasToolRefBlocks(msg.Content) {
+			llmMsg.Contents = convertToolRefContent(msg.Content)
+			llmMsg.Content = ""
+		}
 	}
 
 	toolCalls := msg.ToolCalls()
@@ -444,9 +449,37 @@ func applyToolConfig(request *litellm.Request, tools []agentcore.ToolSpec) {
 				Description: t.Description,
 				Parameters:  t.Parameters,
 			},
+			DeferLoading: t.DeferLoading,
 		})
 	}
 	request.Tools = ltTools
+}
+
+// hasToolRefBlocks reports whether any content block is a tool_reference.
+func hasToolRefBlocks(blocks []agentcore.ContentBlock) bool {
+	for _, b := range blocks {
+		if b.Type == agentcore.ContentToolRef {
+			return true
+		}
+	}
+	return false
+}
+
+// convertToolRefContent converts agentcore ContentBlocks with tool_reference
+// types into litellm MessageContent for API serialization.
+func convertToolRefContent(blocks []agentcore.ContentBlock) []litellm.MessageContent {
+	var parts []litellm.MessageContent
+	for _, b := range blocks {
+		switch b.Type {
+		case agentcore.ContentText:
+			if b.Text != "" {
+				parts = append(parts, litellm.TextContent(b.Text))
+			}
+		case agentcore.ContentToolRef:
+			parts = append(parts, litellm.ToolRefContent(b.ToolName))
+		}
+	}
+	return parts
 }
 
 // safeArgs returns args as json.RawMessage, defaulting to "{}" if empty or invalid JSON.
