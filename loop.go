@@ -28,6 +28,7 @@ func AgentLoop(ctx context.Context, prompts []AgentMessage, agentCtx AgentContex
 
 		currentCtx := AgentContext{
 			SystemPrompt: agentCtx.SystemPrompt,
+			SystemBlocks: agentCtx.SystemBlocks,
 			Messages:     append(copyMessages(agentCtx.Messages), prompts...),
 			Tools:        agentCtx.Tools,
 		}
@@ -65,6 +66,7 @@ func AgentLoopContinue(ctx context.Context, agentCtx AgentContext, config LoopCo
 		var newMessages []AgentMessage
 		currentCtx := AgentContext{
 			SystemPrompt: agentCtx.SystemPrompt,
+			SystemBlocks: agentCtx.SystemBlocks,
 			Messages:     copyMessages(agentCtx.Messages),
 			Tools:        agentCtx.Tools,
 		}
@@ -367,8 +369,17 @@ func callLLM(ctx context.Context, agentCtx *AgentContext, config LoopConfig, ch 
 	// Build tool specs
 	toolSpecs := buildToolSpecs(agentCtx.Tools)
 
-	// Prepend system prompt as first message if set
-	if agentCtx.SystemPrompt != "" {
+	// Prepend system prompt as first message(s)
+	if len(agentCtx.SystemBlocks) > 0 {
+		sysMsgs := make([]Message, len(agentCtx.SystemBlocks))
+		for i, b := range agentCtx.SystemBlocks {
+			sysMsgs[i] = SystemMsg(b.Text)
+			if b.CacheControl != "" {
+				sysMsgs[i].Metadata = map[string]any{"cache_control": b.CacheControl}
+			}
+		}
+		llmMessages = append(sysMsgs, llmMessages...)
+	} else if agentCtx.SystemPrompt != "" {
 		llmMessages = append([]Message{SystemMsg(agentCtx.SystemPrompt)}, llmMessages...)
 	}
 

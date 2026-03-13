@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,6 +28,7 @@ type Agent struct {
 	// Configuration (set via options)
 	model              ChatModel
 	systemPrompt       string
+	systemBlocks       []SystemBlock
 	tools              []Tool
 	maxTurns           int
 	maxRetries         int
@@ -118,6 +120,7 @@ func (a *Agent) PromptMessages(msgs ...AgentMessage) error {
 
 	agentCtx := AgentContext{
 		SystemPrompt: a.systemPrompt,
+		SystemBlocks: a.systemBlocks,
 		Messages:     copyMessages(a.messages),
 		Tools:        a.tools,
 	}
@@ -167,6 +170,7 @@ func (a *Agent) Continue() error {
 
 	agentCtx := AgentContext{
 		SystemPrompt: a.systemPrompt,
+		SystemBlocks: a.systemBlocks,
 		Messages:     copyMessages(a.messages),
 		Tools:        a.tools,
 	}
@@ -232,8 +236,19 @@ func (a *Agent) State() AgentState {
 	for k, v := range a.pendingToolCalls {
 		pending[k] = v
 	}
+	sp := a.systemPrompt
+	if len(a.systemBlocks) > 0 && sp == "" {
+		var sb strings.Builder
+		for i, b := range a.systemBlocks {
+			if i > 0 {
+				sb.WriteString("\n\n")
+			}
+			sb.WriteString(b.Text)
+		}
+		sp = sb.String()
+	}
 	return AgentState{
-		SystemPrompt:     a.systemPrompt,
+		SystemPrompt:     sp,
 		Messages:         copyMessages(a.messages),
 		Tools:            a.tools,
 		IsRunning:        a.isRunning,
@@ -325,11 +340,22 @@ func (a *Agent) SetContextWindow(n int) {
 	a.contextWindow = n
 }
 
-// SetSystemPrompt changes the system prompt. Takes effect on the next turn.
+// SetSystemPrompt changes the system prompt (single-string mode).
+// Clears any multi-block system prompt set via SetSystemBlocks.
 func (a *Agent) SetSystemPrompt(s string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.systemPrompt = s
+	a.systemBlocks = nil
+}
+
+// SetSystemBlocks sets a multi-block system prompt with per-block cache control.
+// Takes precedence over SetSystemPrompt. Clears the single-string prompt.
+func (a *Agent) SetSystemBlocks(blocks []SystemBlock) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.systemBlocks = blocks
+	a.systemPrompt = ""
 }
 
 // SetTools replaces the tool set. Takes effect on the next turn.

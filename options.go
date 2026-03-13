@@ -13,9 +13,15 @@ func WithModel(model ChatModel) AgentOption {
 	return func(a *Agent) { a.model = model }
 }
 
-// WithSystemPrompt sets the system prompt.
+// WithSystemPrompt sets the system prompt (single-string mode).
 func WithSystemPrompt(prompt string) AgentOption {
 	return func(a *Agent) { a.systemPrompt = prompt }
+}
+
+// WithSystemBlocks sets a multi-block system prompt with per-block cache control.
+// Takes precedence over WithSystemPrompt.
+func WithSystemBlocks(blocks []SystemBlock) AgentOption {
+	return func(a *Agent) { a.systemBlocks = blocks; a.systemPrompt = "" }
 }
 
 // WithTools sets the tool list.

@@ -307,6 +307,11 @@ func convertSingleMessage(msg agentcore.Message) litellm.Message {
 		llmMsg.Content = msg.TextContent()
 	}
 
+	// Pass cache_control from Metadata for system messages (multi-block prompt caching).
+	if cc, ok := msg.Metadata["cache_control"].(string); ok && cc != "" {
+		llmMsg.CacheControl = &litellm.CacheControl{Type: cc}
+	}
+
 	if msg.Role == agentcore.RoleTool {
 		if id, ok := msg.Metadata["tool_call_id"].(string); ok {
 			llmMsg.ToolCallID = id

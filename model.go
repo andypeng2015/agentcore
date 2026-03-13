@@ -9,11 +9,19 @@ import (
 // Agent Context & Loop Config
 // ---------------------------------------------------------------------------
 
+// SystemBlock is one segment of a multi-part system prompt.
+// Use with AgentContext.SystemBlocks for per-block cache control.
+type SystemBlock struct {
+	Text         string `json:"text"`
+	CacheControl string `json:"cache_control,omitempty"` // e.g. "ephemeral"
+}
+
 // AgentContext holds the immutable context for a single agent loop invocation.
 type AgentContext struct {
-	SystemPrompt string
-	Messages     []AgentMessage
-	Tools        []Tool
+	SystemPrompt  string        // single-string system prompt (legacy)
+	SystemBlocks  []SystemBlock // multi-block system prompt with cache control (takes precedence)
+	Messages      []AgentMessage
+	Tools         []Tool
 }
 
 // StreamFn is an injectable LLM call function.
