@@ -33,4 +33,4 @@ changelog:
 release:
   github:
     owner: voocel
-    name: litellm
+    name: agentcore
