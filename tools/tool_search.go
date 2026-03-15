@@ -84,7 +84,7 @@ func (t *ToolSearchTool) Schema() map[string]any {
 				"default":     5,
 			},
 		},
-		"required":             []string{"query", "max_results"},
+		"required":             []string{"query"},
 		"additionalProperties": false,
 	}
 }

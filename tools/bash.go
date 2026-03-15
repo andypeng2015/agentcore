@@ -9,29 +9,142 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/voocel/agentcore"
 	"github.com/voocel/agentcore/schema"
 )
 
+// BackgroundShell tracks a background shell command's lifecycle.
+// Output is written to a file on disk (OutputFile) instead of memory.
+type BackgroundShell struct {
+	ID          string
+	Command     string
+	Description string
+	Status      string // "running" | "completed" | "failed"
+	StartedAt   time.Time
+	EndedAt     time.Time
+	OutputFile  string // path to output file on disk
+	ExitCode    int
+	PID         int
+	mu          sync.Mutex
+	cancel      context.CancelFunc
+}
+
+func (bs *BackgroundShell) snapshot() BackgroundShell {
+	bs.mu.Lock()
+	defer bs.mu.Unlock()
+	return BackgroundShell{
+		ID:          bs.ID,
+		Command:     bs.Command,
+		Description: bs.Description,
+		Status:      bs.Status,
+		StartedAt:   bs.StartedAt,
+		EndedAt:     bs.EndedAt,
+		OutputFile:  bs.OutputFile,
+		ExitCode:    bs.ExitCode,
+		PID:         bs.PID,
+	}
+}
+
 // BashTool executes shell commands.
 // Streams stdout+stderr via ReportToolProgress for real-time display.
 // Final result applies tail truncation (2000 lines / 50KB).
+// Supports run_in_background mode for long-running commands.
 type BashTool struct {
-	WorkDir string
-	Timeout time.Duration // default: 2 minutes
+	WorkDir   string
+	Timeout   time.Duration // default: 2 minutes
+	notifyFn  func(agentcore.AgentMessage)
+	outputDir string // directory for background shell output files
+
+	mu       sync.Mutex
+	bgSeq    int
+	bgShells map[string]*BackgroundShell
 }
 
 func NewBash(workDir string) *BashTool {
-	return &BashTool{WorkDir: workDir, Timeout: 2 * time.Minute}
+	return &BashTool{
+		WorkDir:  workDir,
+		Timeout:  2 * time.Minute,
+		bgShells: make(map[string]*BackgroundShell),
+	}
+}
+
+// SetNotifyFn sets the callback invoked when a background shell completes.
+// Typically bound to Agent.FollowUp so the main agent receives the result.
+func (t *BashTool) SetNotifyFn(fn func(agentcore.AgentMessage)) {
+	t.notifyFn = fn
+}
+
+// SetOutputDir sets the directory for background shell output files.
+// If not set, defaults to $TMPDIR/codebot-bg/.
+func (t *BashTool) SetOutputDir(dir string) { t.outputDir = dir }
+
+// outputFilePath returns the path for a background shell's output file.
+func (t *BashTool) outputFilePath(shellID string) string {
+	dir := t.outputDir
+	if dir == "" {
+		dir = filepath.Join(os.TempDir(), "codebot-bg")
+	}
+	_ = os.MkdirAll(dir, 0o700)
+	return filepath.Join(dir, shellID+".output")
+}
+
+// BackgroundShells returns a snapshot of all background shells.
+func (t *BashTool) BackgroundShells() []BackgroundShell {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	shells := make([]BackgroundShell, 0, len(t.bgShells))
+	for _, bs := range t.bgShells {
+		shells = append(shells, bs.snapshot())
+	}
+	return shells
+}
+
+// StopBackgroundShell cancels a running background shell by ID.
+func (t *BashTool) StopBackgroundShell(id string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	bs, ok := t.bgShells[id]
+	if !ok || bs.Status != "running" {
+		return false
+	}
+	bs.cancel()
+	bs.mu.Lock()
+	bs.Status = "failed"
+	bs.ExitCode = -1
+	bs.EndedAt = time.Now()
+	bs.mu.Unlock()
+	return true
+}
+
+// StopAllBackgroundShells cancels all running background shells.
+func (t *BashTool) StopAllBackgroundShells() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	count := 0
+	for _, bs := range t.bgShells {
+		if bs.Status == "running" {
+			bs.cancel()
+			bs.mu.Lock()
+			bs.Status = "failed"
+			bs.ExitCode = -1
+			bs.EndedAt = time.Now()
+			bs.mu.Unlock()
+			count++
+		}
+	}
+	return count
 }
 
 func (t *BashTool) Name() string  { return "bash" }
 func (t *BashTool) Label() string { return "Execute Command" }
 func (t *BashTool) Description() string {
 	return fmt.Sprintf(
-		"Execute a bash command. Output is truncated to last %d lines or %s (whichever is hit first). Optionally provide a timeout in seconds.",
+		"Execute a bash command. Output is truncated to last %d lines or %s (whichever is hit first). "+
+			"Set run_in_background=true for long-running commands; returns immediately and notifies on completion.",
 		defaultMaxLines, formatSize(defaultMaxBytes),
 	)
 }
@@ -39,12 +152,16 @@ func (t *BashTool) Schema() map[string]any {
 	return schema.Object(
 		schema.Property("command", schema.String("Shell command to execute")).Required(),
 		schema.Property("timeout", schema.Int("Timeout in seconds (default: 120)")),
+		schema.Property("description", schema.String("Short description of the command (shown in task list)")),
+		schema.Property("run_in_background", schema.Bool("Run command in background. Returns immediately; a notification is sent when the command completes.")),
 	)
 }
 
 type bashArgs struct {
-	Command string `json:"command"`
-	Timeout int    `json:"timeout"`
+	Command         string `json:"command"`
+	Timeout         int    `json:"timeout"`
+	Description     string `json:"description"`
+	RunInBackground bool   `json:"run_in_background"`
 }
 
 func (t *BashTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
@@ -53,6 +170,160 @@ func (t *BashTool) Execute(ctx context.Context, args json.RawMessage) (json.RawM
 		return nil, fmt.Errorf("invalid args: %w", err)
 	}
 
+	if a.RunInBackground {
+		return t.executeBackground(a)
+	}
+
+	return t.executeForeground(ctx, a)
+}
+
+// executeBackground starts a shell command in a detached goroutine and returns immediately.
+// Output is written to a file on disk for on-demand reading.
+func (t *BashTool) executeBackground(a bashArgs) (json.RawMessage, error) {
+	timeout := 10 * time.Minute // generous default for background
+	if a.Timeout > 0 {
+		timeout = time.Duration(a.Timeout) * time.Second
+	}
+
+	shellPath, shellArgs, err := resolveShell()
+	if err != nil {
+		return nil, err
+	}
+
+	bgCtx, cancel := context.WithTimeout(context.Background(), timeout)
+
+	cmdArgs := append(append([]string{}, shellArgs...), a.Command)
+	cmd := exec.CommandContext(bgCtx, shellPath, cmdArgs...)
+	if t.WorkDir != "" {
+		cmd.Dir = t.WorkDir
+	}
+	configureProcGroup(cmd)
+
+	pr, pw, pipeErr := os.Pipe()
+	if pipeErr != nil {
+		cancel()
+		return nil, fmt.Errorf("create pipe: %w", pipeErr)
+	}
+	cmd.Stdout = pw
+	cmd.Stderr = pw
+
+	if err := cmd.Start(); err != nil {
+		cancel()
+		pr.Close()
+		pw.Close()
+		return nil, fmt.Errorf("start command: %w", err)
+	}
+	pw.Close()
+
+	shellID := t.nextBgID()
+	desc := a.Description
+	if desc == "" {
+		desc = bashTruncate(a.Command, 60)
+	}
+
+	outPath := t.outputFilePath(shellID)
+	outFile, ferr := os.Create(outPath)
+	if ferr != nil {
+		cancel()
+		pr.Close()
+		return nil, fmt.Errorf("create output file: %w", ferr)
+	}
+
+	bs := &BackgroundShell{
+		ID:          shellID,
+		Command:     a.Command,
+		Description: desc,
+		Status:      "running",
+		StartedAt:   time.Now(),
+		OutputFile:  outPath,
+		PID:         cmd.Process.Pid,
+		cancel:      cancel,
+	}
+	t.mu.Lock()
+	t.bgShells[shellID] = bs
+	t.mu.Unlock()
+
+	// Background goroutine: stream output to file, wait for exit, notify.
+	go func() {
+		defer cancel()
+		defer outFile.Close()
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			io.Copy(outFile, pr)
+		}()
+
+		waitErr := cmd.Wait()
+
+		select {
+		case <-done:
+		case <-time.After(500 * time.Millisecond):
+		}
+		pr.Close()
+		<-done
+
+		exitCode := 0
+		status := "completed"
+		if waitErr != nil {
+			status = "failed"
+			if exitErr, ok := waitErr.(*exec.ExitError); ok {
+				exitCode = exitErr.ExitCode()
+			} else {
+				exitCode = -1
+			}
+		}
+
+		bs.mu.Lock()
+		bs.Status = status
+		bs.ExitCode = exitCode
+		bs.EndedAt = time.Now()
+		bs.mu.Unlock()
+
+		t.notifyCompletion(bs)
+	}()
+
+	return json.Marshal(map[string]any{
+		"shell_id":    shellID,
+		"pid":         cmd.Process.Pid,
+		"description": desc,
+		"status":      "running",
+		"message":     fmt.Sprintf("Background command %s started (PID %d). You will receive a notification when it completes.", shellID, cmd.Process.Pid),
+	})
+}
+
+func (t *BashTool) notifyCompletion(bs *BackgroundShell) {
+	if t.notifyFn == nil {
+		return
+	}
+	bs.mu.Lock()
+	result := map[string]any{
+		"shell_id":    bs.ID,
+		"command":     bs.Command,
+		"description": bs.Description,
+		"status":      bs.Status,
+		"exit_code":   bs.ExitCode,
+		"output_file": bs.OutputFile,
+	}
+	bs.mu.Unlock()
+
+	data, err := json.Marshal(result)
+	if err != nil {
+		return
+	}
+	msg := agentcore.UserMsg(fmt.Sprintf("<background-shell-completed>\n%s\n</background-shell-completed>", string(data)))
+	t.notifyFn(msg)
+}
+
+func (t *BashTool) nextBgID() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.bgSeq++
+	return fmt.Sprintf("shell-%d", t.bgSeq)
+}
+
+// executeForeground runs the command synchronously (original behavior).
+func (t *BashTool) executeForeground(ctx context.Context, a bashArgs) (json.RawMessage, error) {
 	timeout := t.Timeout
 	if a.Timeout > 0 {
 		timeout = time.Duration(a.Timeout) * time.Second
@@ -86,11 +357,6 @@ func (t *BashTool) Execute(ctx context.Context, args json.RawMessage) (json.RawM
 	}
 	configureProcGroup(cmd)
 
-	// Use OS pipe so that cmd.Wait() returns as soon as the shell process
-	// exits, without blocking on I/O from background subprocesses that
-	// inherit the pipe's write end. (io.Pipe causes Wait to block because
-	// Go internally creates goroutines to copy from OS fd to the writer,
-	// and Wait waits for those goroutines.)
 	pr, pw, pipeErr := os.Pipe()
 	if pipeErr != nil {
 		return nil, fmt.Errorf("create pipe: %w", pipeErr)
@@ -103,9 +369,8 @@ func (t *BashTool) Execute(ctx context.Context, args json.RawMessage) (json.RawM
 		pw.Close()
 		return nil, fmt.Errorf("start command: %w", err)
 	}
-	pw.Close() // Parent doesn't write; child processes still hold their copy.
+	pw.Close()
 
-	// Stream output in chunks, report progress by complete lines.
 	var output []byte
 	var readErr error
 	done := make(chan struct{})
@@ -142,9 +407,6 @@ func (t *BashTool) Execute(ctx context.Context, args json.RawMessage) (json.RawM
 
 	err = cmd.Wait()
 
-	// Shell has exited. Drain any remaining buffered output, then close
-	// the read end to release the file descriptor. If a background process
-	// still holds the write end open, force-close unblocks the reader.
 	select {
 	case <-done:
 	case <-time.After(500 * time.Millisecond):
@@ -161,7 +423,6 @@ func (t *BashTool) Execute(ctx context.Context, args json.RawMessage) (json.RawM
 		outStr = "(no output)"
 	}
 
-	// Save full output to temp file when it will be truncated
 	var tempPath string
 	if len(outStr) > defaultMaxBytes {
 		if f, ferr := os.CreateTemp("", "agentcore-bash-*.log"); ferr == nil {
@@ -209,4 +470,12 @@ func resolveShell() (string, []string, error) {
 		return p, []string{"-c"}, nil
 	}
 	return "", nil, fmt.Errorf("no shell found: tried bash and sh")
+}
+
+func bashTruncate(s string, maxRunes int) string {
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
+		return s
+	}
+	return string(runes[:maxRunes]) + "..."
 }

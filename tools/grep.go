@@ -240,6 +240,7 @@ func (t *GrepTool) grepWithGo(ctx context.Context, a grepArgs, searchPath string
 
 		rel, _ := filepath.Rel(searchPath, path)
 		scanner := bufio.NewScanner(f)
+		scanner.Buffer(make([]byte, 256*1024), 2*1024*1024)
 		lineNum := 0
 		for scanner.Scan() {
 			lineNum++
@@ -254,6 +255,9 @@ func (t *GrepTool) grepWithGo(ctx context.Context, a grepArgs, searchPath string
 					return filepath.SkipAll
 				}
 			}
+		}
+		if err := scanner.Err(); err != nil {
+			return fmt.Errorf("scan %s: %w", rel, err)
 		}
 		return nil
 	})
