@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -26,13 +27,13 @@ func NewGrep(workDir string) *GrepTool { return &GrepTool{WorkDir: workDir} }
 func (t *GrepTool) Name() string  { return "grep" }
 func (t *GrepTool) Label() string { return "Search Content" }
 func (t *GrepTool) Description() string {
-	return "Search file contents by regex pattern. Returns matching lines with file paths and line numbers (default limit: 100)."
+	return "Fast content search across files. Supports regex patterns by default, or exact text with literal=true. Use glob to narrow which files are searched. Returns relative file paths, line numbers, and matching lines (default limit: 100). Use bash only when you need shell-specific pipelines, counting, or custom post-processing."
 }
 func (t *GrepTool) Schema() map[string]any {
 	return schema.Object(
-		schema.Property("pattern", schema.String("Search pattern (regex by default, or literal with literal=true)")).Required(),
+		schema.Property("pattern", schema.String("Search pattern (regex by default, or exact text with literal=true)")).Required(),
 		schema.Property("path", schema.String("File or directory to search (default: working directory)")),
-		schema.Property("glob", schema.String("File glob filter (e.g. '*.go', '*.ts')")),
+		schema.Property("glob", schema.String("Optional file glob filter (for example: '*.go', 'src/**/*.ts')")),
 		schema.Property("ignoreCase", schema.Bool("Case insensitive search")),
 		schema.Property("literal", schema.Bool("Treat pattern as literal string, not regex")),
 		schema.Property("contextLines", schema.Int("Number of context lines around each match (default: 0)")),
@@ -159,25 +160,38 @@ func (t *GrepTool) grepWithRg(ctx context.Context, a grepArgs, searchPath string
 			break
 		}
 	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan rg output: %w", err)
+	}
 
 	// Kill rg process early if we hit the limit
 	if hitLimit && cmd.Process != nil {
 		cmd.Process.Kill()
 	}
-	cmd.Wait() //nolint: errcheck // exit code 1 (no matches) is normal, not an error
+	waitErr := cmd.Wait()
+	exitCode := 0
+	if waitErr != nil {
+		var exitErr *exec.ExitError
+		if errors.As(waitErr, &exitErr) {
+			exitCode = exitErr.ExitCode()
+		} else if !hitLimit {
+			return nil, fmt.Errorf("wait rg: %w", waitErr)
+		}
+	}
 
 	if len(lines) == 0 {
-		// rg exit code 2 (real error) writes to stderr; exit code 1 (no matches) does not.
-		if errMsg := strings.TrimSpace(stderr.String()); errMsg != "" {
+		errMsg := strings.TrimSpace(stderr.String())
+		if exitCode == 1 || (exitCode == 0 && errMsg == "") {
+			return json.Marshal("No matches found.")
+		}
+		if errMsg != "" {
 			return nil, fmt.Errorf("grep: %s", errMsg)
 		}
 		return json.Marshal("No matches found.")
 	}
 
 	result := strings.Join(lines, "\n")
-	if hitLimit {
-		result += fmt.Sprintf("\n\n[Results truncated at %d matches. Use a more specific pattern or path.]", a.Limit)
-	}
+	result = appendGrepNotices(result, a.Limit, hitLimit, exitCode == 2)
 
 	// Apply byte truncation
 	tr := truncateHead(result, 0, grepMaxBytes)
@@ -221,8 +235,9 @@ func (t *GrepTool) grepWithGo(ctx context.Context, a grepArgs, searchPath string
 			}
 			return nil
 		}
+		rel, _ := filepath.Rel(searchPath, path)
 		if a.Glob != "" {
-			if matched, _ := filepath.Match(a.Glob, d.Name()); !matched {
+			if !globPatternMatches(a.Glob, rel) {
 				return nil
 			}
 		}
@@ -236,28 +251,27 @@ func (t *GrepTool) grepWithGo(ctx context.Context, a grepArgs, searchPath string
 		if err != nil {
 			return nil
 		}
-		defer f.Close()
-
-		rel, _ := filepath.Rel(searchPath, path)
 		scanner := bufio.NewScanner(f)
 		scanner.Buffer(make([]byte, 256*1024), 2*1024*1024)
-		lineNum := 0
+		var lines []string
 		for scanner.Scan() {
-			lineNum++
-			line := scanner.Text()
-			if re.MatchString(line) {
-				if tl, truncated := truncateLine(line, grepMaxLineLen); truncated {
-					line = tl
-				}
-				results = append(results, fmt.Sprintf("%s:%d:%s", rel, lineNum, line))
-				matchCount++
-				if matchCount >= limit {
-					return filepath.SkipAll
-				}
-			}
+			lines = append(lines, scanner.Text())
 		}
+		f.Close()
 		if err := scanner.Err(); err != nil {
 			return fmt.Errorf("scan %s: %w", rel, err)
+		}
+
+		remaining := limit - matchCount
+		if remaining <= 0 {
+			return filepath.SkipAll
+		}
+
+		fileResults, fileMatches, hitLimit := grepFileMatches(rel, lines, re, a.ContextLines, remaining)
+		results = append(results, fileResults...)
+		matchCount += fileMatches
+		if hitLimit || matchCount >= limit {
+			return filepath.SkipAll
 		}
 		return nil
 	})
@@ -271,8 +285,77 @@ func (t *GrepTool) grepWithGo(ctx context.Context, a grepArgs, searchPath string
 	}
 
 	result := strings.Join(results, "\n")
-	if matchCount >= limit {
+	result = appendGrepNotices(result, limit, matchCount >= limit, false)
+	return json.Marshal(result)
+}
+
+func appendGrepNotices(result string, limit int, hitLimit, partial bool) string {
+	if hitLimit {
 		result += fmt.Sprintf("\n\n[Results truncated at %d matches. Use a more specific pattern or path.]", limit)
 	}
-	return json.Marshal(result)
+	if partial {
+		result += "\n\n[Some paths were inaccessible and skipped.]"
+	}
+	return result
+}
+
+func grepFileMatches(rel string, lines []string, re *regexp.Regexp, contextLines, limit int) ([]string, int, bool) {
+	var matchIdx []int
+	for i, line := range lines {
+		if re.MatchString(line) {
+			matchIdx = append(matchIdx, i)
+			if len(matchIdx) >= limit {
+				break
+			}
+		}
+	}
+	if len(matchIdx) == 0 {
+		return nil, 0, false
+	}
+
+	if contextLines <= 0 {
+		out := make([]string, 0, len(matchIdx))
+		for _, idx := range matchIdx {
+			out = append(out, formatGrepOutputLine(rel, idx+1, lines[idx], true))
+		}
+		return out, len(matchIdx), len(matchIdx) >= limit
+	}
+
+	matchSet := make(map[int]bool, len(matchIdx))
+	type interval struct{ start, end int }
+	var intervals []interval
+	for _, idx := range matchIdx {
+		matchSet[idx] = true
+		start := max(idx-contextLines, 0)
+		end := min(idx+contextLines, len(lines)-1)
+		if len(intervals) == 0 || start > intervals[len(intervals)-1].end+1 {
+			intervals = append(intervals, interval{start: start, end: end})
+			continue
+		}
+		if end > intervals[len(intervals)-1].end {
+			intervals[len(intervals)-1].end = end
+		}
+	}
+
+	var out []string
+	for i, iv := range intervals {
+		if i > 0 {
+			out = append(out, "--")
+		}
+		for lineIdx := iv.start; lineIdx <= iv.end; lineIdx++ {
+			out = append(out, formatGrepOutputLine(rel, lineIdx+1, lines[lineIdx], matchSet[lineIdx]))
+		}
+	}
+	return out, len(matchIdx), len(matchIdx) >= limit
+}
+
+func formatGrepOutputLine(rel string, lineNum int, line string, match bool) string {
+	if tl, truncated := truncateLine(line, grepMaxLineLen); truncated {
+		line = tl
+	}
+	sep := "-"
+	if match {
+		sep = ":"
+	}
+	return fmt.Sprintf("%s%s%d%s%s", rel, sep, lineNum, sep, line)
 }

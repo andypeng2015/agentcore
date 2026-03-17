@@ -22,20 +22,22 @@ func NewEdit(workDir string) *EditTool { return &EditTool{WorkDir: workDir} }
 func (t *EditTool) Name() string  { return "edit" }
 func (t *EditTool) Label() string { return "Edit File" }
 func (t *EditTool) Description() string {
-	return "Edit an existing file by replacing one unique text block. Use read first, then copy the exact file content into old_text without any line numbers or prefixes. Preserve indentation for multi-line edits. If the target appears multiple times, include more surrounding context instead of guessing."
+	return "Edit an existing file by replacing one unique text block. Use read first, then copy the exact file content into old_text without any line numbers or prefixes. Preserve indentation for multi-line edits. If the target appears multiple times, include more surrounding context or set replace_all=true to replace every occurrence."
 }
 func (t *EditTool) Schema() map[string]any {
 	return schema.Object(
 		schema.Property("path", schema.String("Path to the file to edit (relative or absolute)")).Required(),
-		schema.Property("old_text", schema.String("Exact text to find and replace (must be unique in the file)")).Required(),
+		schema.Property("old_text", schema.String("Exact text to find and replace (must be unique unless replace_all is true)")).Required(),
 		schema.Property("new_text", schema.String("New text to replace the old text with")).Required(),
+		schema.Property("replace_all", schema.Bool("Replace all occurrences of old_text (default: false)")),
 	)
 }
 
 type editArgs struct {
-	Path    string `json:"path"`
-	OldText string `json:"old_text"`
-	NewText string `json:"new_text"`
+	Path       string `json:"path"`
+	OldText    string `json:"old_text"`
+	NewText    string `json:"new_text"`
+	ReplaceAll bool   `json:"replace_all"`
 }
 
 // editResult holds the parsed and computed edit state, shared by Preview and Execute.
@@ -68,19 +70,32 @@ func (t *EditTool) parseAndMatch(args json.RawMessage) (*editResult, error) {
 	content := normalizeToLF(raw)
 	oldText := normalizeToLF(a.OldText)
 	newText := normalizeToLF(a.NewText)
+	multiline := strings.Contains(oldText, "\n")
 
+	// Matching chain: exact/fuzzy → escape → blockAnchor → indentAware
 	idx, matchLen := fuzzyFind(content, oldText)
-	count := 0
-	usedIndentAware := false
+	needsReindent := false
+
 	if idx < 0 {
-		if strings.Contains(oldText, "\n") {
-			idx, matchLen, count = indentAwareFind(content, oldText)
-			if count > 1 {
-				return nil, fmt.Errorf("found %d indentation-insensitive occurrences of the text in %s. Provide more context", count, a.Path)
-			}
-			usedIndentAware = idx >= 0
+		idx, matchLen = escapeFind(content, oldText)
+	}
+	if idx < 0 && multiline {
+		idx, matchLen = blockAnchorFind(content, oldText)
+		if idx >= 0 {
+			needsReindent = true
 		}
 	}
+	if idx < 0 && multiline {
+		var count int
+		idx, matchLen, count = indentAwareFind(content, oldText)
+		if count > 1 && !a.ReplaceAll {
+			return nil, fmt.Errorf("found %d indentation-insensitive occurrences of the text in %s. Provide more context or use replace_all=true", count, a.Path)
+		}
+		if idx >= 0 {
+			needsReindent = true
+		}
+	}
+
 	if idx < 0 {
 		if hints := formatEditCandidates(content, oldText); hints != "" {
 			return nil, fmt.Errorf("could not find the exact text in %s. The old text must match exactly including all whitespace and newlines.\n\nPossible old_text candidates (copy one exactly):\n%s", a.Path, hints)
@@ -88,18 +103,29 @@ func (t *EditTool) parseAndMatch(args json.RawMessage) (*editResult, error) {
 		return nil, fmt.Errorf("could not find the exact text in %s. The old text must match exactly including all whitespace and newlines", a.Path)
 	}
 
-	count = strings.Count(normalizeForFuzzy(content), normalizeForFuzzy(oldText))
-	if count > 1 {
-		return nil, fmt.Errorf("found %d occurrences of the text in %s. The text must be unique. Provide more context", count, a.Path)
+	matchedText := content[idx : idx+matchLen]
+	replacement := newText
+	if needsReindent {
+		replacement = reindentReplacement(newText, oldText, matchedText)
 	}
 
-	if usedIndentAware {
-		newText = reindentReplacement(newText, oldText, content[idx:idx+matchLen])
+	// Apply replacement
+	var newContent string
+	if a.ReplaceAll {
+		newContent = strings.ReplaceAll(content, matchedText, replacement)
+	} else {
+		count := strings.Count(content, matchedText)
+		if count > 1 {
+			return nil, fmt.Errorf("found %d occurrences of the text in %s. Use replace_all=true to replace all, or provide more context to make the match unique", count, a.Path)
+		}
+		newContent = content[:idx] + replacement + content[idx+matchLen:]
 	}
 
-	newContent := content[:idx] + newText + content[idx+matchLen:]
 	if content == newContent {
-		return nil, fmt.Errorf("no changes made to %s. The replacement produced identical content", a.Path)
+		if replacement == matchedText {
+			return nil, fmt.Errorf("old_text and new_text are identical in %s. Provide a new_text that is different from the matched text", a.Path)
+		}
+		return nil, fmt.Errorf("no changes made to %s. The replacement produced identical content (likely a whitespace or line-ending difference was normalized away)", a.Path)
 	}
 
 	return &editResult{
@@ -300,6 +326,157 @@ func fuzzyFind(content, oldText string) (idx, matchLen int) {
 	return startByte, endByte - startByte
 }
 
+// --- Escape normalization ---
+
+// escapeFind handles LLM sending literal escape sequences (\n, \t, etc.)
+// instead of actual characters. Tries unescaping oldText and matching.
+func escapeFind(content, oldText string) (idx, matchLen int) {
+	unescaped := unescapeText(oldText)
+	if unescaped == oldText {
+		return -1, 0
+	}
+	if i := strings.Index(content, unescaped); i >= 0 {
+		return i, len(unescaped)
+	}
+	return -1, 0
+}
+
+var escapeMap = map[byte]byte{
+	'n': '\n', 't': '\t', 'r': '\r',
+	'\\': '\\', '\'': '\'', '"': '"',
+}
+
+func unescapeText(s string) string {
+	var sb strings.Builder
+	sb.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if i+1 < len(s) && s[i] == '\\' {
+			if replacement, ok := escapeMap[s[i+1]]; ok {
+				sb.WriteByte(replacement)
+				i++
+				continue
+			}
+		}
+		sb.WriteByte(s[i])
+	}
+	return sb.String()
+}
+
+// --- Block anchor matching ---
+
+// blockAnchorFind uses the first and last lines of oldText as anchors,
+// then checks middle content similarity via line-level Levenshtein distance.
+// Returns the range in content that matches, or (-1, 0) if no match.
+func blockAnchorFind(content, oldText string) (idx, matchLen int) {
+	oldLines := strings.Split(oldText, "\n")
+	if len(oldLines) < 3 {
+		return -1, 0
+	}
+	if oldLines[len(oldLines)-1] == "" {
+		oldLines = oldLines[:len(oldLines)-1]
+	}
+	if len(oldLines) < 3 {
+		return -1, 0
+	}
+
+	contentLines := strings.Split(content, "\n")
+	firstAnchor := strings.TrimSpace(oldLines[0])
+	lastAnchor := strings.TrimSpace(oldLines[len(oldLines)-1])
+
+	type candidate struct {
+		startLine, endLine int
+		similarity         float64
+	}
+	var candidates []candidate
+
+	for i, line := range contentLines {
+		if strings.TrimSpace(line) != firstAnchor {
+			continue
+		}
+		for j := i + 2; j < len(contentLines); j++ {
+			if strings.TrimSpace(contentLines[j]) != lastAnchor {
+				continue
+			}
+			sim := blockSimilarity(contentLines[i:j+1], oldLines)
+			candidates = append(candidates, candidate{i, j, sim})
+			break
+		}
+	}
+
+	if len(candidates) == 0 {
+		return -1, 0
+	}
+
+	// Pick the highest-similarity candidate.
+	// Multiple candidates require > 0.3 similarity to avoid false positives.
+	best := candidates[0]
+	for _, c := range candidates[1:] {
+		if c.similarity > best.similarity {
+			best = c
+		}
+	}
+	if len(candidates) > 1 && best.similarity < 0.3 {
+		return -1, 0
+	}
+
+	offsets := lineStartOffsets(content)
+	start := offsets[best.startLine]
+	end := offsets[best.endLine+1]
+	// Trim trailing newline from the matched range
+	if end > start && content[end-1] == '\n' {
+		end--
+	}
+	return start, end - start
+}
+
+// blockSimilarity computes average line similarity for middle lines (0.0 - 1.0).
+func blockSimilarity(block, search []string) float64 {
+	middleCount := min(len(block)-2, len(search)-2)
+	if middleCount <= 0 {
+		return 1.0
+	}
+	var total float64
+	for i := 1; i <= middleCount; i++ {
+		a := strings.TrimSpace(block[i])
+		b := strings.TrimSpace(search[i])
+		maxLen := max(len(a), len(b))
+		if maxLen == 0 {
+			continue
+		}
+		dist := levenshteinDistance(a, b)
+		total += 1.0 - float64(dist)/float64(maxLen)
+	}
+	return total / float64(middleCount)
+}
+
+// levenshteinDistance computes the edit distance between two strings.
+func levenshteinDistance(a, b string) int {
+	if a == "" {
+		return len(b)
+	}
+	if b == "" {
+		return len(a)
+	}
+	ra, rb := []rune(a), []rune(b)
+	prev := make([]int, len(rb)+1)
+	curr := make([]int, len(rb)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 1; i <= len(ra); i++ {
+		curr[0] = i
+		for j := 1; j <= len(rb); j++ {
+			cost := 1
+			if ra[i-1] == rb[j-1] {
+				cost = 0
+			}
+			curr[j] = min(prev[j]+1, min(curr[j-1]+1, prev[j-1]+cost))
+		}
+		prev, curr = curr, prev
+	}
+	return prev[len(rb)]
+}
+
 func indentAwareFind(content, oldText string) (idx, matchLen, count int) {
 	oldLines := strings.Split(oldText, "\n")
 	contentLines := strings.Split(content, "\n")
@@ -447,6 +624,8 @@ type editCandidate struct {
 	score     int
 }
 
+const candidatePreviewLines = 8
+
 func formatEditCandidates(content, oldText string) string {
 	candidates := suggestEditCandidates(content, oldText)
 	if len(candidates) == 0 {
@@ -455,7 +634,32 @@ func formatEditCandidates(content, oldText string) string {
 
 	var sb strings.Builder
 	for i, c := range candidates {
-		fmt.Fprintf(&sb, "%d. lines %d-%d\n```text\n%s\n```\n", i+1, c.startLine, c.endLine, strings.TrimRight(c.block, "\n"))
+		preview := candidatePreview(c.block)
+		fmt.Fprintf(&sb, "%d. lines %d-%d\n```text\n%s\n```\n", i+1, c.startLine, c.endLine, preview)
+		if c.endLine-c.startLine+1 > candidatePreviewLines {
+			fmt.Fprintf(&sb, "   Use read with offset=%d limit=%d to see the full block.\n", c.startLine, c.endLine-c.startLine+1)
+		}
+	}
+	return strings.TrimRight(sb.String(), "\n")
+}
+
+func candidatePreview(block string) string {
+	block = strings.TrimRight(block, "\n")
+	lines := strings.Split(block, "\n")
+	if len(lines) <= candidatePreviewLines {
+		return block
+	}
+	head := candidatePreviewLines / 2
+	tail := candidatePreviewLines - head
+	var sb strings.Builder
+	for _, l := range lines[:head] {
+		sb.WriteString(l)
+		sb.WriteByte('\n')
+	}
+	fmt.Fprintf(&sb, "... (%d lines omitted)\n", len(lines)-head-tail)
+	for _, l := range lines[len(lines)-tail:] {
+		sb.WriteString(l)
+		sb.WriteByte('\n')
 	}
 	return strings.TrimRight(sb.String(), "\n")
 }

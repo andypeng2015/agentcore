@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -23,7 +24,7 @@ func (t *LsTool) Name() string  { return "ls" }
 func (t *LsTool) Label() string { return "List Directory" }
 func (t *LsTool) Description() string {
 	return fmt.Sprintf(
-		"List directory contents. Returns file/directory names with sizes, sorted alphabetically. Depth controls recursive listing (default 1, max 5). Output truncated to %d entries or %s.",
+		"List directory contents as a tree. Use this for quick directory structure checks before reading files. Depth controls recursive listing (default 1, max 5). Use ignore to hide generated or irrelevant paths. Output truncated to %d entries or %s.",
 		lsDefaultLimit, formatSize(defaultMaxBytes),
 	)
 }
@@ -32,16 +33,48 @@ func (t *LsTool) Schema() map[string]any {
 		schema.Property("path", schema.String("Directory path (default: working directory)")),
 		schema.Property("depth", schema.Int("Recursion depth (default: 1, max: 5)")),
 		schema.Property("limit", schema.Int("Maximum entries to return (default: 500)")),
+		schema.Property("ignore", schema.Array("Optional file or directory patterns to ignore (for example: tmp/, *.log, dist)", schema.String("Ignore pattern"))),
 	)
 }
 
 type lsArgs struct {
-	Path  string `json:"path"`
-	Depth int    `json:"depth"`
-	Limit int    `json:"limit"`
+	Path   string   `json:"path"`
+	Depth  int      `json:"depth"`
+	Limit  int      `json:"limit"`
+	Ignore []string `json:"ignore"`
+}
+
+type ignoreMatcher struct {
+	patterns []string
 }
 
 const lsDefaultLimit = 500
+
+var lsDefaultIgnorePatterns = []string{
+	".git/",
+	"node_modules/",
+	"__pycache__/",
+	".venv/",
+	"dist/",
+	"build/",
+	"target/",
+	"vendor/",
+	"bin/",
+	"obj/",
+	".idea/",
+	".vscode/",
+	".cache/",
+	"cache/",
+	"tmp/",
+	"temp/",
+	".coverage",
+	"coverage/",
+	"logs/",
+	"env/",
+	"venv/",
+	".zig-cache/",
+	"zig-out/",
+}
 
 func (t *LsTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMessage, error) {
 	var a lsArgs
@@ -64,42 +97,24 @@ func (t *LsTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMes
 		maxEntries = lsDefaultLimit
 	}
 
-	var entries []string
+	matcher := newIgnoreMatcher(append(append([]string{}, lsDefaultIgnorePatterns...), a.Ignore...))
+	var sb strings.Builder
 	count := 0
+	truncated := false
 
-	err := walkDepth(ctx, dir, dir, 0, depth, func(rel string, info os.FileInfo, isDir bool) bool {
-		if count >= maxEntries {
-			return false
-		}
-		count++
-
-		if isDir {
-			entries = append(entries, rel+"/")
-		} else {
-			entries = append(entries, fmt.Sprintf("%s  %s", rel, formatSize(int(info.Size()))))
-		}
-		return true
-	})
-
-	if err != nil {
+	if err := renderTree(ctx, dir, dir, 0, depth, maxEntries, matcher, &count, &truncated, &sb); err != nil {
 		return nil, fmt.Errorf("ls %s: %w", dir, err)
 	}
 
-	if len(entries) == 0 {
+	if count == 0 {
 		return json.Marshal("(empty directory)")
 	}
 
-	// Sort alphabetically (case-insensitive)
-	sort.Slice(entries, func(i, j int) bool {
-		return strings.ToLower(entries[i]) < strings.ToLower(entries[j])
-	})
-
-	result := strings.Join(entries, "\n")
-	if count >= maxEntries {
+	result := strings.TrimRight(dir, string(filepath.Separator)) + "/\n" + strings.TrimRight(sb.String(), "\n")
+	if truncated {
 		result += fmt.Sprintf("\n\n[Listing truncated at %d entries. Use limit=%d for more, or use a specific subdirectory.]", maxEntries, maxEntries*2)
 	}
 
-	// Apply byte truncation
 	tr := truncateHead(result, 0, defaultMaxBytes)
 	if tr.Truncated {
 		return json.Marshal(tr.Content + "\n\n[Output truncated at " + formatSize(defaultMaxBytes) + ".]")
@@ -107,8 +122,55 @@ func (t *LsTool) Execute(ctx context.Context, args json.RawMessage) (json.RawMes
 	return json.Marshal(result)
 }
 
-func walkDepth(ctx context.Context, root, dir string, current, maxDepth int, fn func(rel string, info os.FileInfo, isDir bool) bool) error {
-	if current >= maxDepth {
+func newIgnoreMatcher(patterns []string) ignoreMatcher {
+	out := make([]string, 0, len(patterns))
+	for _, p := range patterns {
+		p = strings.TrimSpace(filepath.ToSlash(p))
+		if p == "" {
+			continue
+		}
+		out = append(out, p)
+	}
+	return ignoreMatcher{patterns: out}
+}
+
+func (m ignoreMatcher) Match(rel string, isDir bool) bool {
+	if len(m.patterns) == 0 {
+		return false
+	}
+
+	rel = filepath.ToSlash(rel)
+	base := path.Base(rel)
+	for _, pattern := range m.patterns {
+		trimmed := strings.TrimSuffix(pattern, "/")
+		if trimmed == "" {
+			continue
+		}
+
+		if rel == trimmed || strings.HasPrefix(rel, trimmed+"/") {
+			return true
+		}
+		if ok, _ := path.Match(pattern, rel); ok {
+			return true
+		}
+		if ok, _ := path.Match(trimmed, rel); ok {
+			return true
+		}
+		if ok, _ := path.Match(pattern, base); ok {
+			return true
+		}
+		if ok, _ := path.Match(trimmed, base); ok {
+			return true
+		}
+		if isDir && strings.HasSuffix(pattern, "/") && (rel == trimmed || strings.HasPrefix(rel, trimmed+"/")) {
+			return true
+		}
+	}
+	return false
+}
+
+func renderTree(ctx context.Context, root, dir string, current, maxDepth, maxEntries int, matcher ignoreMatcher, count *int, truncated *bool, sb *strings.Builder) error {
+	if current >= maxDepth || *truncated {
 		return nil
 	}
 	if ctx.Err() != nil {
@@ -120,26 +182,50 @@ func walkDepth(ctx context.Context, root, dir string, current, maxDepth int, fn 
 		return err
 	}
 
+	sort.Slice(dirEntries, func(i, j int) bool {
+		return strings.ToLower(dirEntries[i].Name()) < strings.ToLower(dirEntries[j].Name())
+	})
+
 	for _, e := range dirEntries {
 		name := e.Name()
-		if IsSkipDir(name) {
+		isDir := e.IsDir()
+		if isDir && IsSkipDir(name) {
 			continue
 		}
 
-		path := filepath.Join(dir, name)
-		rel, _ := filepath.Rel(root, path)
+		childPath := filepath.Join(dir, name)
+		rel, _ := filepath.Rel(root, childPath)
+		rel = filepath.ToSlash(rel)
+		if matcher.Match(rel, isDir) {
+			continue
+		}
+
+		if *count >= maxEntries {
+			*truncated = true
+			return nil
+		}
+
 		info, err := e.Info()
 		if err != nil {
 			continue
 		}
 
-		isDir := e.IsDir()
-		if !fn(rel, info, isDir) {
-			return nil
+		*count++
+		indent := strings.Repeat("  ", current+1)
+		if isDir {
+			sb.WriteString(indent)
+			sb.WriteString(name)
+			sb.WriteString("/\n")
+		} else {
+			sb.WriteString(indent)
+			sb.WriteString(name)
+			sb.WriteString("  ")
+			sb.WriteString(formatSize(int(info.Size())))
+			sb.WriteByte('\n')
 		}
 
 		if isDir {
-			if err := walkDepth(ctx, root, path, current+1, maxDepth, fn); err != nil {
+			if err := renderTree(ctx, root, childPath, current+1, maxDepth, maxEntries, matcher, count, truncated, sb); err != nil {
 				return err
 			}
 		}
